@@ -18,10 +18,10 @@ data:
   use_synthetic: true
 
   synthetic:
-    n_traces: 256                # crossline extent (image width)
-    n_samples: 256                # time/depth samples (image height)
-    n_layers: 14
-    n_faults: 4
+    n_traces: 701                # matches F3 Netherlands crossline extent exactly
+    n_samples: 255               # matches F3 Netherlands depth samples exactly
+    n_layers: 32                 # more layers = denser reflector package, looks like real F3
+    n_faults: 8                  # more faults = realistic complexity for a North Sea section
     dt_ms: 4
     wavelet_freq_hz: 30
     random_seed: 7
