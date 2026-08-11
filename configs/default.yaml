@@ -15,7 +15,7 @@ data:
   field_volume_path: "data/raw/f3/data/train/train_seismic.npy"   # (401, 701, 255)
   fault_label_path: null         # no real fault GT for F3; FaultSeg trains on synthetic
   facies_label_path: "data/raw/f3/data/train/train_labels.npy"    # real facies labels (6 classes)
-  use_synthetic: false
+  use_synthetic: true
 
   synthetic:
     n_traces: 256                # crossline extent (image width)
