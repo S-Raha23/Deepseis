@@ -15,7 +15,7 @@ data:
   field_volume_path: null   # set to "data/raw/f3/data/train/train_seismic.npy" for real F3 data
   fault_label_path: null
   facies_label_path: null   # set to "data/raw/f3/data/train/train_labels.npy" for real F3 labels
-  use_synthetic: true
+  use_synthetic: false
 
   synthetic:
     n_traces: 701                # matches F3 Netherlands crossline extent exactly
