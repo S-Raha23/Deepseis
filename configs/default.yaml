@@ -1,0 +1,125 @@
+# DeepSeis default configuration
+# All paths are relative to the repo root.
+
+seed: 42
+device: "cpu"          # "cpu" | "cuda" -- auto-falls-back to cpu if cuda unavailable
+
+# ---------------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------------
+data:
+  # Real-data mode: point these at SEG-Y or .npy volumes you provide.
+  # Run `python data/download_f3.py` first to fetch the F3 dataset.
+  # Set use_synthetic: true to fall back to the built-in synthetic generator
+  # (gives a known-clean reference so PSNR/SSIM/Dice can be computed exactly).
+  field_volume_path: "data/raw/f3/data/train/train_seismic.npy"   # (401, 701, 255)
+  fault_label_path: null         # no real fault GT for F3; FaultSeg trains on synthetic
+  facies_label_path: "data/raw/f3/data/train/train_labels.npy"    # real facies labels (6 classes)
+  use_synthetic: false
+
+  synthetic:
+    n_traces: 256                # crossline extent (image width)
+    n_samples: 256                # time/depth samples (image height)
+    n_layers: 14
+    n_faults: 4
+    dt_ms: 4
+    wavelet_freq_hz: 30
+    random_seed: 7
+
+  noise:
+    random_std: 0.6                # incoherent (white) noise std, relative to signal std
+    coherent_amp: 0.7               # ground-roll / coherent noise amplitude
+    coherent_type: "ground_roll"   # "ground_roll" | "linear" | "none"
+    # Deliberately noisy (baseline ~23 dB PSNR): gives the denoiser clear, demonstrable
+    # headroom to show improvement within a modest CPU training budget. See README,
+    # "Why the demo noise level looks aggressive", for the full rationale and the
+    # empirical convergence study behind these numbers.
+
+  patch:
+    size: 64
+    stride: 32
+
+# ---------------------------------------------------------------------------
+# Blind-spot masking
+# ---------------------------------------------------------------------------
+masking:
+  mode: "auto"                   # "n2v" | "struct_n2v" | "auto" (estimate from data)
+  n2v:
+    mask_fraction: 0.12           # fraction of pixels masked per patch (higher than the
+                                   # ~0.2% textbook default -- compensates for having only
+                                   # one small training image instead of a large dataset)
+    neighborhood_radius: 5        # radius for the "swap" replacement strategy
+  struct_n2v:
+    mask_fraction: 0.12
+    blind_shape: "trace"          # "trace" (vertical stripe) | "horizontal" | "diagonal"
+    blind_width: 3                # width of the blind stripe, in pixels
+
+# ---------------------------------------------------------------------------
+# Denoiser model + training
+# ---------------------------------------------------------------------------
+model:
+  denoiser:
+    in_channels: 1
+    base_channels: 16              # smaller/faster net converges more reliably on a
+    depth: 2                       # single-image training set than a larger one does
+
+training:
+  epochs: 40                       # empirically plateaus ~epoch 30-40 for this data/network
+  batch_size: 16
+  lr: 0.001
+  weight_decay: 0.00001
+  augment_flips: true              # h/v-flip patch augmentation -- ~4x effective training
+                                    # patches from one image, meaningfully speeds convergence
+  loss:
+    lambda_edge: 0.04              # kept modest: higher values (e.g. 0.15) were found to
+    lambda_freq: 0.02              # dominate the reconstruction loss and destabilize training
+                                    # on this small single-image dataset -- see README.
+    freq_highpass_cutoff: 0.55    # fraction of Nyquist above which is "high frequency"
+  fault_preservation_enabled: true   # the on/off toggle from the demo script
+  log_every: 5
+  checkpoint_every: 10             # periodic resumable checkpoint (see --resume)
+
+# ---------------------------------------------------------------------------
+# Fault segmentation head (FaultSeg3D-style)
+# ---------------------------------------------------------------------------
+faultseg:
+  pretrained_weights_path: null   # point at real FaultSeg3D weights if you have them
+  base_channels: 16
+  depth: 3
+  train_on_synthetic_if_missing: true
+  epochs: 25
+  lr: 0.001
+  batch_size: 16
+  dice_threshold: 0.5
+
+# ---------------------------------------------------------------------------
+# Stretch: diffusion refiner
+# ---------------------------------------------------------------------------
+diffusion:
+  enabled: true
+  timesteps: 60
+  base_channels: 16
+  physics_prior_weight: 0.05      # wave-smoothness prior weight
+  sample_steps: 20                # DDIM-style sub-sampled inference steps
+  epochs: 6
+
+# ---------------------------------------------------------------------------
+# Stretch: horizon tracking / facies
+# ---------------------------------------------------------------------------
+horizon:
+  enabled: true
+  n_horizons: 4
+  smoothness_weight: 0.5
+
+facies:
+  enabled: true
+  n_classes: 6   # F3 Netherlands has 6 lithostratigraphic facies classes (0-5, Alaudah et al. 2019)
+
+# ---------------------------------------------------------------------------
+# Output paths
+# ---------------------------------------------------------------------------
+output:
+  run_dir: "runs/default"
+  checkpoint_name: "denoiser.pt"
+  faultseg_checkpoint_name: "faultseg.pt"
+  diffusion_checkpoint_name: "diffusion.pt"

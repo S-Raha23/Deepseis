@@ -1,0 +1,11 @@
+torch>=2.1
+numpy>=1.24
+scipy>=1.10
+scikit-image>=0.21
+segyio>=1.9
+einops>=0.7
+streamlit>=1.30
+plotly>=5.18
+PyYAML>=6.0
+matplotlib>=3.7
+pandas>=2.0
