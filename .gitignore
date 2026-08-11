@@ -8,10 +8,3 @@ __pycache__/
 
 # Downloaded raw data (too large for git — run python data/download_f3.py)
 data/raw/
-
-# Trained model weights and intermediate numpy artifacts
-runs/default/*.pt
-runs/default/*.npy
-runs/default/training_ckpt_*.pt
-
-# results.json is small and useful to keep
