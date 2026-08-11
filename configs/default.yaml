@@ -12,9 +12,9 @@ data:
   # Run `python data/download_f3.py` first to fetch the F3 dataset.
   # Set use_synthetic: true to fall back to the built-in synthetic generator
   # (gives a known-clean reference so PSNR/SSIM/Dice can be computed exactly).
-  field_volume_path: "data/raw/f3/data/train/train_seismic.npy"   # (401, 701, 255)
-  fault_label_path: null         # no real fault GT for F3; FaultSeg trains on synthetic
-  facies_label_path: "data/raw/f3/data/train/train_labels.npy"    # real facies labels (6 classes)
+  field_volume_path: null   # set to "data/raw/f3/data/train/train_seismic.npy" for real F3 data
+  fault_label_path: null
+  facies_label_path: null   # set to "data/raw/f3/data/train/train_labels.npy" for real F3 labels
   use_synthetic: true
 
   synthetic:
