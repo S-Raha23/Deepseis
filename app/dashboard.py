@@ -421,7 +421,7 @@ with tab_fault:
                 except: pass
                 return ""
 
-            styled = df_metrics.style.format("{:.4f}").applymap(
+            styled = df_metrics.style.format("{:.4f}").map(
                 _highlight_delta, subset=["Δ (Denoised − Noisy)"]
             )
             st.dataframe(styled, use_container_width=True)
