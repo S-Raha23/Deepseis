@@ -136,7 +136,7 @@ def load_models(config_path: str, run_dir_str: str):
         except Exception:
             facies_model = None  # checkpoint mismatch — will show retrain prompt in tab
 
-    return model_on, model_off, faultseg, facies_model, device
+    return model_on, model_off, faultseg, device
 
 
 @torch.no_grad()
@@ -236,7 +236,7 @@ st.sidebar.success(
     "401 inlines · 701 crosslines · 255 samples"
 )
 
-config_path = st.sidebar.text_input("Config", value="configs/default.yaml")
+config_path = "configs/default.yaml"
 cfg = load_cfg(config_path)
 run_dir = Path(cfg["output"]["run_dir"])
 is_real_data = not cfg["data"].get("use_synthetic", True)
@@ -258,9 +258,9 @@ st.sidebar.caption(
 # STARTUP LOADING SCREEN — runs once, shows progress, then renders the dashboard
 # ---------------------------------------------------------------------------
 
-tab_denoise, tab_fault, tab_survey, tab_facies, tab_export, tab_diag = st.tabs([
+tab_denoise, tab_fault, tab_survey, tab_export, tab_diag = st.tabs([
     "🧮 Denoise", "🧩 Fault segmentation", "🗺️ F3 Survey explorer",
-    "🌊 Facies", "📤 Export", "🔬 Diagnostics",
+    "📤 Export", "🔬 Diagnostics",
 ])
 
 # ── Step 1: load data ───────────────────────────────────────────────────────
@@ -299,7 +299,7 @@ startup_status.empty()
 
 # ── Step 2: load models ─────────────────────────────────────────────────────
 load_prog = st.progress(33, text="⚙️ Step 2 / 3 — Loading pre-trained model checkpoints...")
-model_on, model_off, faultseg, facies_model, device = load_models(config_path, str(run_dir))
+model_on, model_off, faultseg, device = load_models(config_path, str(run_dir))
 load_prog.progress(66, text="🧠 Step 3 / 3 — Running denoiser inference on seismic section...")
 
 # ── Step 3: run inference ───────────────────────────────────────────────────
@@ -335,20 +335,6 @@ with tab_denoise:
                             use_container_width=True, key="denoise_single")
 
     st.markdown("**\"Ordinary denoisers erase the geology. Ours protects it.\"** — toggle above to see it live.")
-
-    if is_real_data:
-        st.info("Running on **real F3 field data** — no clean reference exists for field surveys, so PSNR/SSIM are not reported. Visual comparison above shows the fault-preservation effect on real geology.")
-    else:
-        st.markdown("#### Live metrics vs. known-clean synthetic reference")
-        m_noisy = {"PSNR": metrics_mod.psnr(noisy, clean), "SSIM": metrics_mod.ssim(noisy, clean)}
-        m_on    = {"PSNR": metrics_mod.psnr(denoised_on, clean),  "SSIM": metrics_mod.ssim(denoised_on, clean)}
-        m_off   = {"PSNR": metrics_mod.psnr(denoised_off, clean), "SSIM": metrics_mod.ssim(denoised_off, clean)}
-        mcols = st.columns(3)
-        for col, label, m in zip(mcols, ["Noisy (baseline)", "Denoised OFF", "Denoised ON"],
-                                  [m_noisy, m_off, m_on]):
-            with col:
-                st.metric(f"{label} — PSNR", f"{m['PSNR']:.2f} dB")
-                st.metric(f"{label} — SSIM", f"{m['SSIM']:.4f}")
 
 
 # ---------------------------------------------------------------------------
@@ -438,40 +424,7 @@ with tab_survey:
 
 
 # ---------------------------------------------------------------------------
-# Tab 4: Facies
-# ---------------------------------------------------------------------------
-
-with tab_facies:
-    st.subheader("Facies segmentation — F3 lithostratigraphic labels (6 classes)")
-    if facies_model is None:
-        st.warning("No facies checkpoint found (`runs/default/facies.pt`). Use the Retrain button in the sidebar.")
-    else:
-        with st.spinner("Running facies inference on denoised section..."):
-            n_classes  = cfg["facies"].get("n_classes", 6)
-            facies_map = run_facies_inference(facies_model, denoised_on, cfg, device)
-
-        cols = st.columns(2)
-        with cols[0]:
-            st.plotly_chart(seismic_heatmap(denoised_on, "Denoised seismic (inline 0)"),
-                            use_container_width=True, key="facies_seismic")
-        with cols[1]:
-            st.plotly_chart(facies_heatmap(facies_map, "Predicted facies (6 classes)", n_classes),
-                            use_container_width=True, key="facies_map")
-
-        unique, counts = np.unique(facies_map, return_counts=True)
-        total = facies_map.size
-        class_names = ["Upper North Sea","Middle North Sea","Lower North Sea","Rijnland/Chalk","Jurassic","Triassic"]
-        df_f = pd.DataFrame({
-            "Class": [f"{c} — {class_names[c]}" if c < len(class_names) else f"Class {c}" for c in unique],
-            "Pixels": counts,
-            "Coverage (%)": [f"{100*c/total:.1f}" for c in counts],
-        })
-        st.dataframe(df_f, use_container_width=True, hide_index=True)
-        st.info("**F3 class legend (Alaudah et al. 2019):** 0 = Upper North Sea · 1 = Middle North Sea · 2 = Lower North Sea · 3 = Rijnland/Chalk · 4 = Jurassic · 5 = Triassic")
-
-
-# ---------------------------------------------------------------------------
-# Tab 5: Export
+# Tab 4: Export
 # ---------------------------------------------------------------------------
 
 with tab_export:
