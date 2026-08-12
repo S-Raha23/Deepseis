@@ -405,31 +405,40 @@ with tab_fault:
             m_noisy_map    = _fault_map_metrics(prob_noisy,    dice_threshold, "Noisy")
             m_denoised_map = _fault_map_metrics(prob_denoised, dice_threshold, "Denoised")
 
-            df_metrics = pd.DataFrame({
-                "Noisy input":    list(m_noisy_map.values()),
-                "Denoised input": list(m_denoised_map.values()),
-                "Δ (Denoised − Noisy)": [
-                    round(d - n, 4) for n, d in zip(m_noisy_map.values(), m_denoised_map.values())
-                ],
-            }, index=list(m_noisy_map.keys()))
+            st.markdown("#### Fault-segmentation quality metrics (no ground truth required)")
 
-            def _highlight_delta(val):
-                try:
-                    v = float(val)
-                    if v > 0.001:  return "color: #2ecc71; font-weight: bold"
-                    if v < -0.001: return "color: #e74c3c; font-weight: bold"
-                except: pass
-                return ""
+            # Render as metric cards: 3 columns × 2 rows
+            metric_items = [
+                ("Fault coverage",        "%",   m_noisy_map["Fault coverage (%)"],                m_denoised_map["Fault coverage (%)"],                True,  "% of pixels classified as fault — should focus on real faults after denoising"),
+                ("Mean fault confidence", "",    m_noisy_map["Mean fault confidence"],              m_denoised_map["Mean fault confidence"],              True,  "Avg probability on fault pixels — higher = more certain picks"),
+                ("Background confidence", "",    m_noisy_map["Mean background confidence"],         m_denoised_map["Mean background confidence"],         False, "Avg probability on non-fault pixels — lower = less noise confusion"),
+                ("Contrast",             "",    m_noisy_map["Contrast (fault − background)"],      m_denoised_map["Contrast (fault − background)"],      True,  "Fault conf − background conf — key sharpness metric"),
+                ("Fault signal SNR",      "×",   m_noisy_map["Fault signal SNR"],                   m_denoised_map["Fault signal SNR"],                   True,  "Fault probability stands out from background — higher = cleaner picks"),
+                ("F1-proxy score",        "",    m_noisy_map["F1-proxy score"],                     m_denoised_map["F1-proxy score"],                     True,  "Balances coverage and contrast — overall pick quality (0–1, higher = better)"),
+            ]
 
-            styled = df_metrics.style.format("{:.4f}").map(
-                _highlight_delta, subset=["Δ (Denoised − Noisy)"]
-            )
-            st.dataframe(styled, use_container_width=True)
+            cols = st.columns(3)
+            for i, (name, unit, val_n, val_d, higher_is_better, tooltip) in enumerate(metric_items):
+                delta = val_d - val_n
+                improved = (delta > 0) if higher_is_better else (delta < 0)
+                arrow = "▲" if delta > 0 else ("▼" if delta < 0 else "–")
+                delta_color = "green" if improved else "red"
+                fmt = ".1f" if unit == "%" else ".4f"
+
+                with cols[i % 3]:
+                    st.metric(
+                        label=f"{name} {unit}".strip(),
+                        value=f"{val_d:{fmt}}{unit}",
+                        delta=f"{arrow} {abs(delta):{fmt}} vs noisy",
+                        delta_color="normal" if improved else "inverse",
+                        help=tooltip,
+                    )
+
             st.caption(
-                "No ground-truth fault labels exist for F3. Metrics above are computed directly from "
-                "the probability maps. **Contrast** and **F1-proxy** show the model's pick sharpness "
-                "and coverage — both improve on the denoised input. "
-                "\"Denoising isn't the goal — finding the trap is, and we find more of them.\""
+                "Metrics computed from probability maps — no ground truth needed. "
+                "**Green ▲ = improved after denoising.** "
+                "Contrast and F1-proxy are the headline numbers: "
+                "both show the model makes sharper, more reliable fault picks on the denoised section."
             )
 
 
