@@ -126,12 +126,15 @@ def load_models(config_path: str, run_dir_str: str):
     facies_model = None
     facies_path = run_dir / "facies.pt"
     if facies_path.exists():
-        n_classes = cfg["facies"].get("n_classes", 6)
-        facies_model = FaciesNet2D(in_channels=1, n_classes=n_classes,
-                                    base_channels=cfg["faultseg"]["base_channels"],
-                                    depth=cfg["faultseg"]["depth"]).to(device)
-        facies_model.load_state_dict(torch.load(facies_path, map_location=device))
-        facies_model.eval()
+        try:
+            n_classes = cfg["facies"].get("n_classes", 6)
+            facies_model = FaciesNet2D(in_channels=1, n_classes=n_classes,
+                                        base_channels=cfg["faultseg"]["base_channels"],
+                                        depth=cfg["faultseg"]["depth"]).to(device)
+            facies_model.load_state_dict(torch.load(facies_path, map_location=device), strict=False)
+            facies_model.eval()
+        except Exception:
+            facies_model = None  # checkpoint mismatch — will show retrain prompt in tab
 
     return model_on, model_off, faultseg, facies_model, device
 
