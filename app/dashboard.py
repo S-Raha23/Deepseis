@@ -428,19 +428,19 @@ with tab_denoise:
     cols = st.columns(3 if fault_preservation_view == "Side-by-side" else 2)
     with cols[0]:
         st.plotly_chart(seismic_heatmap(noisy, f"{DATASET_LABEL} raw input (inline 0)"),
-                        use_container_width=True, key="denoise_noisy")
+                        width='stretch', key="denoise_noisy")
     if fault_preservation_view == "Side-by-side":
         with cols[1]:
             st.plotly_chart(seismic_heatmap(denoised_off, "Denoised — fault-preservation OFF"),
-                            use_container_width=True, key="denoise_off")
+                            width='stretch', key="denoise_off")
         with cols[2]:
             st.plotly_chart(seismic_heatmap(denoised_on, "Denoised — fault-preservation ON"),
-                            use_container_width=True, key="denoise_on")
+                            width='stretch', key="denoise_on")
     else:
         shown = denoised_on if fault_preservation_view == "ON" else denoised_off
         with cols[1]:
             st.plotly_chart(seismic_heatmap(shown, f"Denoised — fault-preservation {fault_preservation_view}"),
-                            use_container_width=True, key="denoise_single")
+                            width='stretch', key="denoise_single")
 
     st.markdown("**\"Ordinary denoisers erase the geology. Ours protects it.\"** — toggle above to see it live.")
 
@@ -461,13 +461,13 @@ with tab_fault:
         cols = st.columns(3)
         with cols[0]:
             st.plotly_chart(seismic_heatmap(noisy, f"{DATASET_LABEL} raw input"),
-                            use_container_width=True, key="fault_noisy")
+                            width='stretch', key="fault_noisy")
         with cols[1]:
             st.plotly_chart(overlay_heatmap(noisy, prob_noisy, "Fault picks — NOISY", threshold=dice_threshold),
-                            use_container_width=True, key="fault_overlay_noisy")
+                            width='stretch', key="fault_overlay_noisy")
         with cols[2]:
             st.plotly_chart(overlay_heatmap(denoised_on, prob_denoised, "Fault picks — DENOISED", threshold=dice_threshold),
-                            use_container_width=True, key="fault_overlay_denoised")
+                            width='stretch', key="fault_overlay_denoised")
 
         st.markdown("#### Fault-segmentation metrics")
         if fault_mask is not None:
@@ -477,7 +477,7 @@ with tab_fault:
                 "Noisy input":   [fm_n.dice, fm_n.precision, fm_n.recall, fm_n.roc_auc, fm_n.mean_distance_error],
                 "Denoised input":[fm_d.dice, fm_d.precision, fm_d.recall, fm_d.roc_auc, fm_d.mean_distance_error],
             }, index=["Dice","Precision","Recall","ROC-AUC","Mean distance error (px ↓)"])
-            st.dataframe(df.style.format("{:.3f}"), use_container_width=True)
+            st.dataframe(df.style.format("{:.3f}"), width='stretch')
             st.caption("\"Denoising isn't the goal — finding the trap is, and we find more of them.\"")
         else:
             # No ground-truth fault labels for real surveys — compute self-referential quality metrics
@@ -578,10 +578,10 @@ with tab_survey:
     cols = st.columns(3)
     with cols[0]:
         st.plotly_chart(seismic_heatmap(section_noisy,    f"Inline {inline_idx} — raw"),
-                        use_container_width=True, key="survey_noisy")
+                        width='stretch', key="survey_noisy")
     with cols[1]:
         st.plotly_chart(seismic_heatmap(section_denoised, f"Inline {inline_idx} — denoised"),
-                        use_container_width=True, key="survey_denoised")
+                        width='stretch', key="survey_denoised")
     with cols[2]:
         if faultseg is not None:
             prob = run_faultseg_inference(faultseg, section_denoised, cfg, device)
@@ -591,10 +591,10 @@ with tab_survey:
                                            fault_mask=prob >= dice_threshold)
                 for h in horizons:
                     fig.add_trace(go.Scatter(y=h, mode="lines", line=dict(width=2), showlegend=False))
-            st.plotly_chart(fig, use_container_width=True, key="survey_interpreted")
+            st.plotly_chart(fig, width='stretch', key="survey_interpreted")
         else:
             st.plotly_chart(seismic_heatmap(section_denoised, "Interpreted (retrain FaultSeg to enable)"),
-                            use_container_width=True, key="survey_interp_placeholder")
+                            width='stretch', key="survey_interp_placeholder")
 
     if is_real_data:
         st.caption(f"**Survey:** {DATASET_LABEL} ({ds['region']}) · "
@@ -629,14 +629,14 @@ with tab_facies:
         cols = st.columns(3 if has_gt else 2)
         with cols[0]:
             st.plotly_chart(seismic_heatmap(denoised_on, "Denoised seismic (inline 0)"),
-                            use_container_width=True, key="facies_seismic")
+                            width='stretch', key="facies_seismic")
         with cols[1]:
             st.plotly_chart(facies_heatmap(facies_map, "Predicted facies", n_facies),
-                            use_container_width=True, key="facies_map")
+                            width='stretch', key="facies_map")
         if has_gt:
             with cols[2]:
                 st.plotly_chart(facies_heatmap(facies_labels, "Ground-truth facies", n_facies),
-                                use_container_width=True, key="facies_gt")
+                                width='stretch', key="facies_gt")
 
         if has_gt:
             accuracy = float((facies_map == facies_labels).mean())
@@ -676,7 +676,7 @@ with tab_facies:
                 union = int(np.logical_or(facies_map == c, facies_labels == c).sum())
                 row["IoU (%)"] = f"{100 * inter / union:.1f}" if union else "—"
             rows.append(row)
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
 
         st.caption(f"**{DATASET_LABEL} class legend:** "
                    + " · ".join(f"{i} = {n}" for i, n in enumerate(class_names)))
@@ -727,7 +727,7 @@ with tab_export:
     st.markdown("---")
     st.markdown("#### Denoised section preview")
     st.plotly_chart(seismic_heatmap(denoised_on, "Denoised inline 0 — fault-preservation ON"),
-                    use_container_width=True, key="export_preview")
+                    width='stretch', key="export_preview")
     st.caption(f"Shape: {denoised_on.shape[0]} samples × {denoised_on.shape[1]} traces | "
                f"Range: [{denoised_on.min():.3f}, {denoised_on.max():.3f}]")
 
@@ -747,11 +747,11 @@ with tab_diag:
     with cols[0]:
         st.plotly_chart(go.Figure(go.Heatmap(z=fk_noisy, colorscale="Viridis"))
                         .update_layout(title="F-K — raw", height=350, margin=dict(l=10,r=10,t=40,b=10)),
-                        use_container_width=True, key="diag_fk_noisy")
+                        width='stretch', key="diag_fk_noisy")
     with cols[1]:
         st.plotly_chart(go.Figure(go.Heatmap(z=fk_denoised, colorscale="Viridis"))
                         .update_layout(title="F-K — denoised", height=350, margin=dict(l=10,r=10,t=40,b=10)),
-                        use_container_width=True, key="diag_fk_denoised")
+                        width='stretch', key="diag_fk_denoised")
 
     st.markdown("#### Signal-leakage map — no geology removed")
     st.caption("Values near zero = removed component is noise, not geology.")
@@ -760,7 +760,7 @@ with tab_diag:
     st.plotly_chart(go.Figure(go.Heatmap(z=sim_map, colorscale="RdBu", zmid=0, zmin=-1, zmax=1))
                     .update_layout(title="Local correlation: (noisy − denoised) vs. denoised", height=380,
                                    yaxis=dict(autorange="reversed"), margin=dict(l=10,r=10,t=40,b=10)),
-                    use_container_width=True, key="diag_sim_map")
+                    width='stretch', key="diag_sim_map")
 
     st.markdown("#### Jacobian mask explainer")
     st.caption("Pick a pixel — see which inputs the denoiser relies on and what blind-spot mask that implies.")
@@ -781,7 +781,7 @@ with tab_diag:
             st.plotly_chart(go.Figure(go.Heatmap(z=jac, colorscale="Inferno"))
                             .update_layout(title="Sensitivity |d(output)/d(input)|", height=350,
                                            margin=dict(l=10,r=10,t=40,b=10)),
-                            use_container_width=True, key="diag_jacobian")
+                            width='stretch', key="diag_jacobian")
         with c2:
             st.write(f"**Suggested blind shape:** `{suggestion.suggested_blind_shape}`")
             st.write(f"**Suggested blind width:** `{suggestion.suggested_blind_width}` px")
