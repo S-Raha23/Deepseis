@@ -6,5 +6,8 @@ __pycache__/
 .ipynb_checkpoints/
 .DS_Store
 
-# Downloaded raw data (too large for git — run python data/download_f3.py)
+# Downloaded raw data (too large for git — run the data/download_*.py scripts)
 data/raw/
+
+# Scratch output from the browser-automation QA pass (screenshots + tab dumps)
+.codex_*

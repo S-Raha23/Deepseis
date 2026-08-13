@@ -107,6 +107,22 @@ def prepare_data(cfg: dict) -> dict:
         noisy = noisy.astype(np.float32)
         print(f"[deepseis] loaded field volume from {dcfg['field_volume_path']}, shape={noisy.shape}")
 
+        # Normalize to unit std. This is REQUIRED, not cosmetic: surveys are published
+        # at wildly different amplitude scales (F3 ships pre-scaled to [-1, 1] with
+        # std ~0.23; Parihaka ships raw with std ~366, a factor of ~1600), and the
+        # loss weights, learning rate and the lambda_edge/lambda_freq balance are all
+        # tuned for unit-scale data -- raw Parihaka amplitudes diverge immediately.
+        #
+        # It is also what makes training agree with inference: `infer.py` and the
+        # dashboard both divide the input by its std before calling the model, so
+        # without this the model would be fitted at one scale and served at another.
+        input_std = float(noisy.std())
+        if input_std > 1e-8:
+            noisy = noisy / input_std
+            print(f"[deepseis] normalized field volume to unit std (was {input_std:.4f})")
+        else:
+            print("[deepseis] warning: field volume has near-zero std — check your input file.")
+
         # Real facies labels (optional — F3 has them, most surveys don't)
         facies = None
         if dcfg.get("facies_label_path"):
@@ -481,9 +497,48 @@ def refine_with_diffusion(diffusion: GaussianDiffusion, denoised: np.ndarray, cf
 # Orchestration
 # ---------------------------------------------------------------------------
 
+def apply_dataset(cfg: dict, dataset_key: str) -> dict:
+    """Point the config at one survey from the ``datasets:`` registry.
+
+    Rewrites the three fields that select what gets trained on -- the volume, the
+    facies labels, and the output directory -- so that training a registered
+    survey is ``--dataset <key>`` rather than three manual config edits. Each
+    survey writes to its own ``run_dir``: the denoiser is self-supervised, so a
+    model fitted to one survey's noise is not the model to run on another.
+    """
+    registry = cfg.get("datasets", {})
+    if dataset_key not in registry or dataset_key == "default":
+        known = [k for k in registry if k != "default"]
+        raise SystemExit(f"[deepseis] unknown --dataset '{dataset_key}'. Registered: {known}")
+
+    spec = registry[dataset_key]
+    for field, key in (("field_volume_path", "local_seismic"), ("facies_label_path", "local_labels")):
+        path = Path(spec[key])
+        if not path.exists():
+            raise SystemExit(
+                f"[deepseis] {spec['label']}: {path} not found.\n"
+                f"           Fetch it first:  python data/download_{dataset_key}.py"
+            )
+        cfg["data"][field] = str(path)
+
+    cfg["data"]["use_synthetic"] = False
+    cfg["output"]["run_dir"] = spec.get("run_dir", cfg["output"]["run_dir"])
+    cfg["facies"]["n_classes"] = spec.get("n_facies", cfg["facies"]["n_classes"])
+
+    print(f"[deepseis] dataset '{dataset_key}' -> {spec['label']} ({spec['region']})")
+    print(f"[deepseis]   volume  {cfg['data']['field_volume_path']}")
+    print(f"[deepseis]   labels  {cfg['data']['facies_label_path']}")
+    print(f"[deepseis]   run_dir {cfg['output']['run_dir']}")
+    return cfg
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/default.yaml")
+    parser.add_argument("--dataset", type=str, default=None,
+                         help="train on a survey from the config's `datasets:` registry "
+                              "(e.g. f3, parihaka). Sets the volume, labels and run_dir "
+                              "for you; without it the `data:` block is used as written.")
     parser.add_argument("--skip-stretch", action="store_true", help="skip diffusion + facies (faster run)")
     parser.add_argument("--resume", action="store_true",
                          help="resume denoiser training from the last periodic checkpoint, if present "
@@ -491,6 +546,8 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    if args.dataset:
+        cfg = apply_dataset(cfg, args.dataset)
     device = get_device(cfg)
     set_seed(cfg["seed"])
 
@@ -503,7 +560,7 @@ def main() -> None:
     syn_clean = data["syn_clean"]
     syn_fault_mask = data["syn_fault_mask"]
 
-    results: dict = {"config_path": str(args.config)}
+    results: dict = {"config_path": str(args.config), "dataset": args.dataset or "(config as written)"}
 
     # ---- Stage 1: denoiser, trained twice (fault-preservation ON vs OFF) ----
     print("\n=== Training denoiser: fault-preservation OFF ===")

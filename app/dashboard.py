@@ -1,14 +1,21 @@
 """
-DeepSeis dashboard — F3 Netherlands real data
+DeepSeis dashboard — real post-stack seismic surveys
 Fault-preserving self-supervised seismic denoising & auto-interpretation.
+
+The survey shown is chosen from the sidebar and comes from the ``datasets:``
+registry in the config (F3 Netherlands by default, Parihaka as a second option).
+Every registered survey is stored in the same canonical layout, so each tab reads
+whichever one is selected without any per-survey special-casing.
 
 Run with:
     streamlit run app/dashboard.py
 """
 from __future__ import annotations
 
+import copy
 import io
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -48,25 +55,38 @@ def load_cfg(config_path: str) -> dict:
 
 
 @st.cache_data(show_spinner=False)
-def fetch_f3_from_hf() -> tuple[str, str]:
+def resolve_dataset(config_path: str, dataset_key: str) -> tuple[str, str, str]:
+    """Locate a registered survey's (seismic, labels) files. Returns (seismic, labels, origin).
+
+    Local copies are preferred so that a machine which has already run the
+    survey's download script never re-downloads; otherwise the file is pulled
+    from the survey's Hugging Face mirror (the only route that works on
+    Streamlit Cloud, where ``data/raw/`` does not exist).
+    """
+    spec = load_cfg(config_path)["datasets"][dataset_key]
+    repo_root = Path(__file__).parent.parent
+
+    local_seismic = repo_root / spec["local_seismic"]
+    local_labels = repo_root / spec["local_labels"]
+    if local_seismic.exists() and local_labels.exists():
+        return str(local_seismic), str(local_labels), "local"
+
     from huggingface_hub import hf_hub_download
-    seismic_path = hf_hub_download(
-        repo_id="SRaha23/f3-netherlands", filename="train_seismic.npy",
-        repo_type="dataset", local_dir="/tmp/f3",
-    )
-    labels_path = hf_hub_download(
-        repo_id="SRaha23/f3-netherlands", filename="train_labels.npy",
-        repo_type="dataset", local_dir="/tmp/f3",
-    )
-    return seismic_path, labels_path
+    # tempfile.gettempdir() rather than a hardcoded "/tmp" so this also works on Windows.
+    cache_dir = Path(tempfile.gettempdir()) / "deepseis_data" / dataset_key
+    seismic_path = hf_hub_download(repo_id=spec["hf_repo"], filename=spec["hf_seismic"],
+                                    repo_type="dataset", local_dir=str(cache_dir))
+    labels_path = hf_hub_download(repo_id=spec["hf_repo"], filename=spec["hf_labels"],
+                                   repo_type="dataset", local_dir=str(cache_dir))
+    return seismic_path, labels_path, "huggingface"
 
 
 @st.cache_data(show_spinner=False)
-def get_demo_section(config_path: str):
+def get_demo_section(config_path: str, dataset_key: str):
     cfg = load_cfg(config_path)
     dcfg = cfg["data"]
     if not dcfg.get("use_synthetic", True):
-        seismic_path, labels_path = fetch_f3_from_hf()
+        seismic_path, labels_path, _ = resolve_dataset(config_path, dataset_key)
         noisy_raw = segy_mod.load_volume(seismic_path)
         if noisy_raw.ndim == 3:
             noisy_raw = noisy_raw[0].T
@@ -89,8 +109,8 @@ def get_survey(config_path: str, n_inlines: int):
 
 
 @st.cache_data(show_spinner=False)
-def load_f3_full() -> np.ndarray:
-    seismic_path, _ = fetch_f3_from_hf()
+def load_full_volume(config_path: str, dataset_key: str) -> np.ndarray:
+    seismic_path, _, _ = resolve_dataset(config_path, dataset_key)
     vol = segy_mod.load_volume(seismic_path)
     std = vol.std()
     return (vol / (std + 1e-8)).astype("float32")
@@ -161,14 +181,26 @@ def run_facies_inference(model: FaciesNet2D, section: np.ndarray, cfg: dict, dev
     return (out // count).astype(np.int32)
 
 
-def run_training(config_path: str, run_dir: Path) -> None:
-    cfg = load_cfg(config_path)
+def run_training(config_path: str, run_dir: Path, dataset_key: str) -> None:
+    """Retrain the denoiser + FaultSeg head for one survey, into that survey's run_dir."""
+    cfg = copy.deepcopy(load_cfg(config_path))
+    spec = cfg["datasets"][dataset_key]
+
+    # Point the config at the selected survey. resolve_dataset() is used rather than
+    # the registry's local_* paths directly, because on Streamlit Cloud the only copy
+    # of the data is the Hugging Face mirror it downloads into a temp dir.
+    if not cfg["data"].get("use_synthetic", True):
+        seismic_path, labels_path, _ = resolve_dataset(config_path, dataset_key)
+        cfg["data"]["field_volume_path"] = seismic_path
+        cfg["data"]["facies_label_path"] = labels_path
+    cfg["facies"]["n_classes"] = spec.get("n_facies", cfg["facies"]["n_classes"])
+
     device = get_device(cfg)
     set_seed(cfg["seed"])
     run_dir.mkdir(parents=True, exist_ok=True)
     from deepseis.train import prepare_data as _prepare_data
 
-    st.info("⏳ Preparing data...")
+    st.info(f"⏳ Preparing {spec['label']} data...")
     data = _prepare_data(cfg)
     noisy = data["noisy"]
     syn_clean = data["syn_clean"]
@@ -228,30 +260,52 @@ def facies_heatmap(class_map: np.ndarray, title: str, n_classes: int) -> go.Figu
 # Sidebar
 # ---------------------------------------------------------------------------
 
-st.sidebar.title("\U0001FAA8 DeepSeis")
-st.sidebar.caption("Fault-preserving self-supervised seismic denoising & auto-interpretation")
-st.sidebar.success(
-    "📡 **Real data:** F3 Netherlands block\n\n"
-    "Alaudah et al. 2019 · Zenodo 3755060\n"
-    "401 inlines · 701 crosslines · 255 samples"
-)
-
 config_path = "configs/default.yaml"
 cfg = load_cfg(config_path)
-run_dir = Path(cfg["output"]["run_dir"])
 is_real_data = not cfg["data"].get("use_synthetic", True)
 
+DATASETS = cfg.get("datasets", {})
+DATASET_KEYS = [k for k in DATASETS if k != "default"]
+
+st.sidebar.title("\U0001FAA8 DeepSeis")
+st.sidebar.caption("Fault-preserving self-supervised seismic denoising & auto-interpretation")
+
+# ---- Survey selection -----------------------------------------------------
+st.sidebar.markdown("#### Survey")
+_default_key = DATASETS.get("default", "f3")
+dataset_key = st.sidebar.selectbox(
+    "Survey",
+    DATASET_KEYS,
+    index=DATASET_KEYS.index(_default_key) if _default_key in DATASET_KEYS else 0,
+    format_func=lambda k: DATASETS[k]["label"],
+    label_visibility="collapsed",
+    help="Switch the survey every tab operates on. The denoiser is self-supervised, "
+         "so it adapts to whichever survey's noise you point it at — use Retrain "
+         "below to fit it to the selected one.",
+)
+ds = DATASETS[dataset_key]
+DATASET_LABEL = ds["label"]
+# Each survey has its own checkpoints -- see `run_dir` in the registry.
+run_dir = Path(ds.get("run_dir", cfg["output"]["run_dir"]))
+
+st.sidebar.success(
+    f"📡 **{DATASET_LABEL}** — {ds['region']}\n\n"
+    f"{ds['citation']}\n\n"
+    f"{ds['geometry']}"
+)
+
+st.sidebar.markdown("---")
 fault_preservation_view = st.sidebar.radio("Fault-preservation loss", ["ON", "OFF", "Side-by-side"], index=2)
 dice_threshold = st.sidebar.slider("Fault probability threshold", 0.1, 0.9,
                                     cfg["faultseg"]["dice_threshold"], 0.05)
 st.sidebar.markdown("---")
-if st.sidebar.button("🔄 Retrain models from scratch"):
-    run_training(config_path, run_dir)
+if st.sidebar.button(f"🔄 Retrain on {DATASET_LABEL}"):
+    run_training(config_path, run_dir, dataset_key)
     st.rerun()
 st.sidebar.caption(
-    "Running on the **F3 Netherlands block** (Alaudah et al. 2019, Zenodo) — "
-    "real post-stack seismic · self-supervised denoiser · FaultSeg3D workflow · "
-    "real 6-class facies labels."
+    f"Running on the **{DATASET_LABEL}** survey ({ds['region']}) — "
+    f"real post-stack seismic · self-supervised denoiser · FaultSeg3D workflow · "
+    f"real {ds['n_facies']}-class facies labels."
 )
 
 # ---------------------------------------------------------------------------
@@ -259,29 +313,51 @@ st.sidebar.caption(
 # ---------------------------------------------------------------------------
 
 tab_denoise, tab_fault, tab_survey, tab_export, tab_diag = st.tabs([
-    "🧮 Denoise", "🧩 Fault segmentation", "🗺️ F3 Survey explorer",
+    "🧮 Denoise", "🧩 Fault segmentation", "🗺️ Survey explorer",
     "📤 Export", "🔬 Diagnostics",
 ])
 
 # ── Step 1: load data ───────────────────────────────────────────────────────
 if not checkpoints_exist(run_dir, cfg):
-    st.warning("No trained checkpoints found. Training now — this takes a few minutes...")
-    run_training(config_path, run_dir)
-    st.rerun()
+    # Deliberately does NOT auto-train: fitting a survey takes tens of minutes on
+    # CPU, which is not something to start silently inside a page load. Offer the
+    # command and an explicit button instead.
+    st.warning(
+        f"**No trained checkpoints for {DATASET_LABEL}** (looked in `{run_dir}`).\n\n"
+        f"Train it from the command line — much faster than in-browser, and resumable:\n\n"
+        f"```\npython -m deepseis.train --config {config_path} --dataset {dataset_key}\n```\n\n"
+        f"Or use **🔄 Retrain on {DATASET_LABEL}** in the sidebar to run it here. "
+        f"Meanwhile you can switch to another survey in the sidebar."
+    )
+    st.stop()
 
 startup_progress = st.empty()
 startup_status = st.empty()
 
 if is_real_data:
     with startup_progress.container():
-        prog = st.progress(0, text="📡 Step 1 / 3 — Downloading F3 Netherlands data from Hugging Face (~640 MB)...")
+        prog = st.progress(0, text=f"📡 Step 1 / 3 — Loading {DATASET_LABEL} survey data...")
     with startup_status.container():
-        st.info("Fetching `train_seismic.npy` and `train_labels.npy` from `SRaha23/f3-netherlands` on Hugging Face. This only happens once per session.")
-    clean, noisy, fault_mask, facies_labels = get_demo_section(config_path)
+        st.info(f"Fetching `{ds['hf_seismic']}` and `{ds['hf_labels']}` for **{DATASET_LABEL}** — "
+                f"from `data/raw/` if present, otherwise from `{ds['hf_repo']}` on Hugging Face. "
+                f"This only happens once per session.")
+    try:
+        clean, noisy, fault_mask, facies_labels = get_demo_section(config_path, dataset_key)
+    except Exception as exc:
+        startup_progress.empty()
+        startup_status.empty()
+        st.error(
+            f"**Could not load the {DATASET_LABEL} survey.**\n\n"
+            f"`{type(exc).__name__}: {exc}`\n\n"
+            f"Fetch it locally with `python data/download_{dataset_key}.py`, or publish the "
+            f"mirror it expects with `python data/mirror_to_hf.py --dataset {dataset_key}`. "
+            f"Pick another survey in the sidebar to carry on in the meantime."
+        )
+        st.stop()
 else:
     with startup_progress.container():
         prog = st.progress(0, text="🧪 Step 1 / 3 — Generating synthetic seismic section (701×255)...")
-    clean, noisy, fault_mask, facies_labels = get_demo_section(config_path)
+    clean, noisy, fault_mask, facies_labels = get_demo_section(config_path, dataset_key)
 
 # fallback if data still None
 if noisy is None:
@@ -316,10 +392,10 @@ load_prog.empty()
 # ---------------------------------------------------------------------------
 
 with tab_denoise:
-    st.subheader("F3 Netherlands — Noisy → Denoised, fault-preservation loss toggled")
+    st.subheader(f"{DATASET_LABEL} — Noisy → Denoised, fault-preservation loss toggled")
     cols = st.columns(3 if fault_preservation_view == "Side-by-side" else 2)
     with cols[0]:
-        st.plotly_chart(seismic_heatmap(noisy, "F3 raw input (inline 0)"),
+        st.plotly_chart(seismic_heatmap(noisy, f"{DATASET_LABEL} raw input (inline 0)"),
                         use_container_width=True, key="denoise_noisy")
     if fault_preservation_view == "Side-by-side":
         with cols[1]:
@@ -342,7 +418,7 @@ with tab_denoise:
 # ---------------------------------------------------------------------------
 
 with tab_fault:
-    st.subheader("Fault segmentation — noisy vs. denoised F3 input")
+    st.subheader(f"Fault segmentation — noisy vs. denoised {DATASET_LABEL} input")
     if faultseg is None:
         st.warning("No FaultSeg checkpoint found — use the Retrain button in the sidebar.")
     else:
@@ -352,7 +428,7 @@ with tab_fault:
 
         cols = st.columns(3)
         with cols[0]:
-            st.plotly_chart(seismic_heatmap(noisy, "F3 raw input"),
+            st.plotly_chart(seismic_heatmap(noisy, f"{DATASET_LABEL} raw input"),
                             use_container_width=True, key="fault_noisy")
         with cols[1]:
             st.plotly_chart(overlay_heatmap(noisy, prob_noisy, "Fault picks — NOISY", threshold=dice_threshold),
@@ -372,7 +448,7 @@ with tab_fault:
             st.dataframe(df.style.format("{:.3f}"), use_container_width=True)
             st.caption("\"Denoising isn't the goal — finding the trap is, and we find more of them.\"")
         else:
-            # No ground-truth fault labels for F3 — compute self-referential quality metrics
+            # No ground-truth fault labels for real surveys — compute self-referential quality metrics
             # from the probability maps: confidence, coverage, contrast, and SNR of the fault signal
             def _fault_map_metrics(prob: np.ndarray, threshold: float, label: str) -> dict:
                 binary = prob >= threshold
@@ -449,14 +525,14 @@ with tab_fault:
 # ---------------------------------------------------------------------------
 
 with tab_survey:
-    st.subheader("F3 Netherlands — scrub through real inlines")
+    st.subheader(f"{DATASET_LABEL} — scrub through real inlines")
     if is_real_data:
-        with st.spinner("Loading full F3 volume (401 inlines × 701 × 255) — cached after first load..."):
-            f3_vol = load_f3_full()
-        n_inlines_f3 = f3_vol.shape[0]
-        inline_idx = st.slider("Inline (F3 Netherlands)", 0, n_inlines_f3 - 1, n_inlines_f3 // 2,
-                                help="Scrub through all 401 real inlines.")
-        section_noisy    = f3_vol[inline_idx].T
+        with st.spinner(f"Loading full {DATASET_LABEL} volume ({ds['geometry']}) — cached after first load..."):
+            full_vol = load_full_volume(config_path, dataset_key)
+        n_inlines_real = full_vol.shape[0]
+        inline_idx = st.slider(f"Inline ({DATASET_LABEL})", 0, n_inlines_real - 1, n_inlines_real // 2,
+                                help=f"Scrub through all {n_inlines_real} real inlines.")
+        section_noisy    = full_vol[inline_idx].T
         with st.spinner(f"Running denoiser on inline {inline_idx}..."):
             section_denoised = run_denoiser_inference(model_on, section_noisy, cfg, device)
     else:
@@ -489,7 +565,9 @@ with tab_survey:
                             use_container_width=True, key="survey_interp_placeholder")
 
     if is_real_data:
-        st.caption("**Dataset:** F3 Netherlands · Alaudah et al. 2019 · [Zenodo 3755060](https://zenodo.org/record/3755060) · 401 inlines · 701 crosslines · 255 samples at 4 ms.")
+        st.caption(f"**Survey:** {DATASET_LABEL} ({ds['region']}) · "
+                   f"[{ds['citation']}]({ds['citation_url']}) · "
+                   f"{ds['geometry']} at {ds['dt_ms']} ms.")
 
 
 # ---------------------------------------------------------------------------
@@ -497,29 +575,31 @@ with tab_survey:
 # ---------------------------------------------------------------------------
 
 with tab_export:
-    st.subheader("Export denoised F3 section")
+    st.subheader(f"Export denoised {DATASET_LABEL} section")
     st.markdown("Download the denoised inline 0. SEG-Y preserves standard headers for OpendTect / Petrel / Kingdom.")
     export_format = st.radio("Format", ["SEG-Y (.sgy)", "NumPy (.npy)"], horizontal=True)
+    # Name the file after the survey so exports from two surveys don't collide.
+    export_stem = f"{dataset_key}_denoised_inline0"
     if st.button("Generate export"):
         if export_format == "NumPy (.npy)":
             buf = io.BytesIO()
             np.save(buf, denoised_on)
             buf.seek(0)
-            st.download_button("⬇️ Download denoised_inline0.npy", buf,
-                               file_name="denoised_inline0.npy", mime="application/octet-stream")
+            st.download_button(f"⬇️ Download {export_stem}.npy", buf,
+                               file_name=f"{export_stem}.npy", mime="application/octet-stream")
         else:
-            import tempfile, os
+            import os
             buf = io.BytesIO()
             with tempfile.NamedTemporaryFile(suffix=".sgy", delete=False) as tmp:
                 tmp_path = tmp.name
             try:
                 segy_mod.write_segy_like(tmp_path, denoised_on, template_path=None,
-                                          dt_ms=cfg["data"]["synthetic"]["dt_ms"])
+                                          dt_ms=ds["dt_ms"])
                 with open(tmp_path, "rb") as f:
                     buf.write(f.read())
                 buf.seek(0)
-                st.download_button("⬇️ Download denoised_inline0.sgy", buf,
-                                   file_name="denoised_inline0.sgy", mime="application/octet-stream")
+                st.download_button(f"⬇️ Download {export_stem}.sgy", buf,
+                                   file_name=f"{export_stem}.sgy", mime="application/octet-stream")
             finally:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
