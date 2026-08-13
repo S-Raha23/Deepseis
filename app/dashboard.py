@@ -49,8 +49,20 @@ FACIES_COLORS = ["#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00", "#a65628
 # Cached loaders
 # ---------------------------------------------------------------------------
 
-@st.cache_data(show_spinner=False)
+REPO_ROOT = Path(__file__).parent.parent
+
+
 def load_cfg(config_path: str) -> dict:
+    """Parse the config. Deliberately NOT cached.
+
+    It was previously wrapped in @st.cache_data keyed on the path string alone.
+    That key never changes, so when Streamlit Cloud pulled new code and re-ran
+    the script in a still-warm process, it returned the config parsed *before*
+    the deploy -- new code reading an old config, which crashed with a KeyError
+    the moment the code expected a config section the cached copy predated.
+    Parsing a few KB of YAML is far cheaper than that failure mode, and every
+    caller that actually does expensive work is cached in its own right.
+    """
     return load_config(config_path)
 
 
@@ -266,12 +278,25 @@ def facies_heatmap(class_map: np.ndarray, title: str, n_classes: int) -> go.Figu
 # Sidebar
 # ---------------------------------------------------------------------------
 
-config_path = "configs/default.yaml"
+# Absolute, so the app does not depend on the working directory it was launched from.
+config_path = str(REPO_ROOT / "configs" / "default.yaml")
 cfg = load_cfg(config_path)
 is_real_data = not cfg["data"].get("use_synthetic", True)
 
 DATASETS = cfg.get("datasets", {})
 DATASET_KEYS = [k for k in DATASETS if k != "default"]
+
+if not DATASET_KEYS:
+    # Never index into an empty registry -- that surfaced as a bare KeyError with
+    # no indication of the cause. Say what is wrong and where to look instead.
+    st.error(
+        f"**No surveys are registered.** `{config_path}` has no usable `datasets:` section, "
+        f"so there is nothing to display.\n\n"
+        f"Found top-level config keys: `{', '.join(sorted(cfg)) or '(none)'}`.\n\n"
+        f"If this app was just redeployed, restart it from **Manage app → Reboot** — a warm "
+        f"process can otherwise keep serving a configuration parsed before the deploy."
+    )
+    st.stop()
 
 st.sidebar.title("\U0001FAA8 DeepSeis")
 st.sidebar.caption("Fault-preserving self-supervised seismic denoising & auto-interpretation")
