@@ -105,6 +105,25 @@ in the sidebar loads that survey's checkpoints automatically. If a survey has no
 yet, the dashboard says so and offers the command rather than silently starting a
 tens-of-minutes CPU training run inside a page load.
 
+### Running the dashboard on a memory-capped host
+
+The hosted app is memory-limited, and two things dominated its footprint. Both are
+fixed; the numbers are measured RSS for a full 6-tab render:
+
+| | Before | After |
+|---|---|---|
+| First render (F3) | 1413 MB | 506 MB |
+| After switching to Parihaka | 3378 MB | 616 MB |
+
+- **Inference is batched** (`INFERENCE_BATCH` in `deepseis/train.py`). Running a whole
+  section's patches through the network in one pass cost 1.29 GB for Parihaka, because a
+  U-Net skip connection keeps an `(N, C, 64, 64)` tensor alive from encoder to decoder, so
+  peak scales with patch count. Batching caps it at a fixed ~75 MB. The network is
+  per-patch, so output is bit-identical.
+- **Sections are read through a memory map** (`read_inline` in `app/dashboard.py`). The
+  dashboard displays one inline at a time, but previously loaded the whole cube to get it —
+  573 MB read to use 0.7 MB.
+
 ### Facies results, and what they do and don't mean
 
 | | F3 Netherlands | Parihaka |

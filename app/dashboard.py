@@ -93,21 +93,47 @@ def resolve_dataset(config_path: str, dataset_key: str) -> tuple[str, str, str]:
     return seismic_path, labels_path, "huggingface"
 
 
+def read_inline(seismic_path: str, idx: int) -> np.ndarray:
+    """One inline as (n_samples, n_traces) float32, normalized to unit std.
+
+    Memory-mapped: touches roughly one inline's worth of bytes rather than the
+    whole cube. This matters more than it looks. The dashboard only ever
+    *displays* a single inline, but the previous implementations materialized
+    the entire volume to get one -- F3 is 573 MB on disk as float64 and Parihaka
+    465 MB, which drove resident memory to 1.4 GB on first render and 3.4 GB
+    after switching surveys, over the cap on a hosted runner and killed without
+    a Python traceback.
+
+    Normalizing by the section's own std (rather than the whole volume's) also
+    matches how ``train.prepare_data`` normalized the training section, so the
+    denoiser sees inputs on the scale it was actually fitted at.
+    """
+    if seismic_path.endswith(".npy"):
+        vol = np.load(seismic_path, mmap_mode="r")
+        section = np.asarray(vol[idx], dtype=np.float32).T
+    else:  # SEG-Y / .dat have no mmap path -- fall back to a full read
+        section = segy_mod.load_volume(seismic_path)[idx].astype(np.float32).T
+    return section / (float(section.std()) + 1e-8)
+
+
+@st.cache_data(show_spinner=False)
+def volume_shape(config_path: str, dataset_key: str) -> tuple[int, ...]:
+    """Volume dimensions, without reading the samples."""
+    seismic_path, _, _ = resolve_dataset(config_path, dataset_key)
+    if seismic_path.endswith(".npy"):
+        return tuple(np.load(seismic_path, mmap_mode="r").shape)
+    return tuple(segy_mod.load_volume(seismic_path).shape)
+
+
 @st.cache_data(show_spinner=False)
 def get_demo_section(config_path: str, dataset_key: str):
     cfg = load_cfg(config_path)
     dcfg = cfg["data"]
     if not dcfg.get("use_synthetic", True):
         seismic_path, labels_path, _ = resolve_dataset(config_path, dataset_key)
-        noisy_raw = segy_mod.load_volume(seismic_path)
-        if noisy_raw.ndim == 3:
-            noisy_raw = noisy_raw[0].T
-        noisy = noisy_raw.astype("float32")
-        std = noisy.std()
-        if std > 0:
-            noisy = noisy / std
+        noisy = read_inline(seismic_path, 0)
         labels_vol = np.load(labels_path, mmap_mode="r")
-        facies = labels_vol[0].T.astype(np.int64)
+        facies = np.asarray(labels_vol[0]).T.astype(np.int64)
         return None, noisy, None, facies
     rng = np.random.default_rng(dcfg["synthetic"]["random_seed"])
     vol = synth_mod.generate_from_config(cfg)
@@ -118,18 +144,6 @@ def get_demo_section(config_path: str, dataset_key: str):
 @st.cache_data(show_spinner=False)
 def get_survey(config_path: str, n_inlines: int):
     return synth_mod.generate_synthetic_survey(n_inlines=n_inlines, random_seed=7)
-
-
-# max_entries=1 so switching surveys evicts the previous volume rather than
-# holding both -- these are hundreds of MB each and Streamlit Cloud is memory-capped.
-@st.cache_data(show_spinner=False, max_entries=1)
-def load_full_volume(config_path: str, dataset_key: str) -> np.ndarray:
-    seismic_path, _, _ = resolve_dataset(config_path, dataset_key)
-    # Cast to float32 BEFORE dividing. F3 ships as float64 (573 MB), so dividing
-    # first would allocate a second float64 array and only then narrow it --
-    # a ~1.4 GB peak instead of ~860 MB, on a host with a hard memory cap.
-    vol = segy_mod.load_volume(seismic_path).astype("float32")
-    return vol / (float(vol.std()) + 1e-8)
 
 
 def checkpoints_exist(run_dir: Path, cfg: dict) -> bool:
@@ -186,9 +200,14 @@ def run_facies_inference(model: FaciesNet2D, section: np.ndarray, cfg: dict, dev
     pcfg = cfg["data"]["patch"]
     h, w = section.shape
     patches = patch_mod.extract_patches(section, pcfg["size"], pcfg["stride"])
-    x = to_tensor(patches, device)
-    logits = model(x)
-    preds = logits.argmax(dim=1).detach().cpu().numpy()
+    # Batched for the same reason as the denoiser and fault heads -- see
+    # INFERENCE_BATCH in deepseis/train.py. argmax is taken per chunk so the
+    # (N, n_classes, 64, 64) logits never exist for the whole section at once.
+    from deepseis.train import INFERENCE_BATCH
+    preds = np.concatenate([
+        model(to_tensor(patches[i:i + INFERENCE_BATCH], device)).argmax(dim=1).detach().cpu().numpy()
+        for i in range(0, len(patches), INFERENCE_BATCH)
+    ], axis=0)
     coords = patch_coords(h, w, pcfg["size"], pcfg["stride"])
     out = np.zeros((h, w), dtype=np.int32)
     count = np.zeros((h, w), dtype=np.int32)
@@ -559,12 +578,14 @@ with tab_fault:
 with tab_survey:
     st.subheader(f"{DATASET_LABEL} — scrub through real inlines")
     if is_real_data:
-        with st.spinner(f"Loading full {DATASET_LABEL} volume ({ds['geometry']}) — cached after first load..."):
-            full_vol = load_full_volume(config_path, dataset_key)
-        n_inlines_real = full_vol.shape[0]
+        # Only the shape is needed to build the slider; the samples stay on disk
+        # until an inline is actually requested.
+        n_inlines_real = volume_shape(config_path, dataset_key)[0]
         inline_idx = st.slider(f"Inline ({DATASET_LABEL})", 0, n_inlines_real - 1, n_inlines_real // 2,
                                 help=f"Scrub through all {n_inlines_real} real inlines.")
-        section_noisy    = full_vol[inline_idx].T
+        seismic_path, _, _ = resolve_dataset(config_path, dataset_key)
+        with st.spinner(f"Reading inline {inline_idx}..."):
+            section_noisy = read_inline(seismic_path, inline_idx)
         with st.spinner(f"Running denoiser on inline {inline_idx}..."):
             section_denoised = run_denoiser_inference(model_on, section_noisy, cfg, device)
     else:

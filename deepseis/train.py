@@ -295,6 +295,28 @@ def train_denoiser(cfg: dict, noisy: np.ndarray, fault_preservation_enabled: boo
     return model, history
 
 
+#: How many patches to push through the network at once during inference.
+#: Inference peak memory is dominated by intermediate activations, not weights:
+#: a U-Net skip connection holds an (N, C, 64, 64) tensor alive from the encoder
+#: all the way to the decoder, so cost scales linearly with N. Running a whole
+#: section in one pass allocated 1.29 GB for Parihaka's 558 patches -- enough to
+#: get the hosted app OOM-killed. Batching caps it at a fixed ~75 MB regardless
+#: of section size, at no cost to the result: the network is per-patch, so the
+#: output is identical either way.
+INFERENCE_BATCH = 32
+
+
+@torch.no_grad()
+def _forward_in_batches(model, patches: np.ndarray, device: str,
+                         batch: int = INFERENCE_BATCH) -> np.ndarray:
+    """Run ``model`` over ``patches`` in fixed-size chunks. Returns (N, H, W)."""
+    outs = []
+    for i in range(0, len(patches), batch):
+        chunk = to_tensor(patches[i:i + batch], device)
+        outs.append(model(chunk).detach().cpu().numpy()[:, 0])
+    return np.concatenate(outs, axis=0) if outs else np.empty((0,) + patches.shape[1:], np.float32)
+
+
 @torch.no_grad()
 def run_denoiser_inference(model: DenoiserUNet, noisy: np.ndarray, cfg: dict, device: str) -> np.ndarray:
     """Full-image inference: patchify, run the (un-masked) forward pass, stitch back together."""
@@ -302,9 +324,7 @@ def run_denoiser_inference(model: DenoiserUNet, noisy: np.ndarray, cfg: dict, de
     pcfg = cfg["data"]["patch"]
     h, w = noisy.shape
     patches = patch_mod.extract_patches(noisy, pcfg["size"], pcfg["stride"])
-    x = to_tensor(patches, device)
-    out = model(x)                              # (N, 1, H, W)
-    out_np = out.detach().cpu().numpy()[:, 0]    # (N, H, W) -- always, regardless of N
+    out_np = _forward_in_batches(model, patches, device)
     return patch_mod.stitch_patches(out_np, h, w, pcfg["size"], pcfg["stride"])
 
 
@@ -376,9 +396,7 @@ def run_faultseg_inference(model: FaultSegNet2D, section: np.ndarray, cfg: dict,
     pcfg = cfg["data"]["patch"]
     h, w = section.shape
     patches = patch_mod.extract_patches(section, pcfg["size"], pcfg["stride"])
-    x = to_tensor(patches, device)
-    out = model(x)                              # (N, 1, H, W)
-    out_np = out.detach().cpu().numpy()[:, 0]    # (N, H, W)
+    out_np = _forward_in_batches(model, patches, device)
     return patch_mod.stitch_patches(out_np, h, w, pcfg["size"], pcfg["stride"])
 
 
