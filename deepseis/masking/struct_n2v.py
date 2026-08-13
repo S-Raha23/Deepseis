@@ -111,6 +111,26 @@ def estimate_noise_type(patch: np.ndarray) -> str:
     Compares the 2D autocorrelation's spatial extent along the trace axis
     against the sample axis: coherent/ground-roll noise produces a much
     longer-range lateral autocorrelation than incoherent noise does.
+
+    .. warning::
+       Measured against known inputs, this does **not** separate coherent noise
+       from coherent *signal*, because it reads the whole patch and a seismic
+       patch is dominated by laterally continuous reflectors either way:
+
+           synthetic + ground roll   -> 98% of patches "coherent"
+           synthetic + white noise   -> 100% of patches "coherent"   <-- same verdict
+           real F3                   -> 76% of patches "coherent"
+
+       A section with no coherent noise at all scores as high as one full of it,
+       so ``masking.mode: "auto"`` routes patches on geology rather than on noise.
+       Estimating from a high-pass residual instead does not rescue it: a 3x3
+       residual calls both synthetic cases 0% (ground roll is low-frequency and
+       gets removed with the signal), a 7x7 residual calls both ~100%.
+
+       Prefer setting ``masking.mode`` explicitly to ``"n2v"`` or ``"struct_n2v"``
+       for a survey you know, rather than relying on this. It is kept because the
+       spec calls for it and it is honest about incoherent-vs-coherent on bare
+       noise fields; it is not reliable on real seismic.
     """
     from numpy.fft import fft2, ifft2
 

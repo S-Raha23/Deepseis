@@ -107,6 +107,16 @@ def prepare_data(cfg: dict) -> dict:
         noisy = noisy.astype(np.float32)
         print(f"[deepseis] loaded field volume from {dcfg['field_volume_path']}, shape={noisy.shape}")
 
+        # Normalize to unit std so training and serving agree. F3 ships pre-scaled
+        # to [-1, 1] (std ~0.23) while the dashboard and infer.py both divide the
+        # section by its own std before calling the model -- without this the
+        # denoiser is fitted at one amplitude scale and served at another, 4.4x
+        # apart. The loss weights and learning rate are tuned for unit scale too.
+        input_std = float(noisy.std())
+        if input_std > 1e-8:
+            noisy = noisy / input_std
+            print(f"[deepseis] normalized field volume to unit std (was {input_std:.4f})")
+
         # Real facies labels (optional — F3 has them, most surveys don't)
         facies = None
         if dcfg.get("facies_label_path"):
@@ -246,7 +256,8 @@ def train_denoiser(cfg: dict, noisy: np.ndarray, fault_preservation_enabled: boo
             freq_l = torch.tensor(0.0, device=device)
             if fault_preservation_enabled:
                 edge_l = edge_preservation_loss(pred, y)
-                freq_l = fk_high_freq_loss(pred, y, cutoff=tcfg["loss"]["freq_highpass_cutoff"])
+                freq_l = fk_high_freq_loss(pred, y, cutoff=tcfg["loss"]["freq_highpass_cutoff"],
+                                            floor_ratio=tcfg["loss"].get("freq_floor_ratio", 0.6))
                 total = recon + tcfg["loss"]["lambda_edge"] * edge_l + tcfg["loss"]["lambda_freq"] * freq_l
 
             opt.zero_grad()
@@ -393,7 +404,21 @@ def train_facies(cfg: dict, clean: np.ndarray, facies: np.ndarray, device: str) 
         clean_patches = augment_with_flips(clean_patches)
         facies_patches = augment_with_flips(facies_patches.astype(np.float32)).astype(np.int64)
 
-    epochs = 6
+    # Inverse-frequency class weights. F3's units are very unevenly represented in
+    # a single inline -- Lower North Sea covers 45.8% of the section while Triassic
+    # covers 2.3% -- and unweighted cross-entropy minimises total error by simply
+    # never predicting the rare class, which is exactly what it did: Triassic
+    # scored 0% IoU while every other unit scored 80-99%. Weighting by inverse
+    # frequency makes a Triassic pixel worth proportionally more than a Lower
+    # North Sea one, so ignoring the class stops being the cheap option.
+    counts = np.bincount(facies_patches.reshape(-1), minlength=n_classes).astype(np.float64)
+    weights = np.where(counts > 0, counts.sum() / (n_classes * np.maximum(counts, 1)), 0.0)
+    class_weight = torch.tensor(weights, dtype=torch.float32, device=device)
+    print(f"[facies] class weights: {np.round(weights, 2).tolist()}")
+
+    # Configurable: the facies loss was still falling at the old hardcoded 6,
+    # i.e. the head was being stopped while underfit.
+    epochs = int(fcfg.get("epochs", 6))
     for epoch in range(epochs):
         idx = np.arange(len(clean_patches))
         rng.shuffle(idx)
@@ -404,7 +429,7 @@ def train_facies(cfg: dict, clean: np.ndarray, facies: np.ndarray, device: str) 
             y = torch.from_numpy(facies_patches[b]).long().to(device)
 
             logits = model(x)
-            loss = nn.functional.cross_entropy(logits, y)
+            loss = nn.functional.cross_entropy(logits, y, weight=class_weight)
 
             opt.zero_grad()
             loss.backward()

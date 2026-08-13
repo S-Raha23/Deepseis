@@ -12,9 +12,9 @@ data:
   # Run `python data/download_f3.py` first to fetch the F3 dataset.
   # Set use_synthetic: true to fall back to the built-in synthetic generator
   # (gives a known-clean reference so PSNR/SSIM/Dice can be computed exactly).
-  field_volume_path: null   # set to "data/raw/f3/data/train/train_seismic.npy" for real F3 data
+  field_volume_path: "data/raw/f3/data/train/train_seismic.npy"
   fault_label_path: null
-  facies_label_path: null   # set to "data/raw/f3/data/train/train_labels.npy" for real F3 labels
+  facies_label_path: "data/raw/f3/data/train/train_labels.npy"
   use_synthetic: false
 
   synthetic:
@@ -45,12 +45,15 @@ data:
 masking:
   mode: "auto"                   # "n2v" | "struct_n2v" | "auto" (estimate from data)
   n2v:
-    mask_fraction: 0.12           # fraction of pixels masked per patch (higher than the
-                                   # ~0.2% textbook default -- compensates for having only
-                                   # one small training image instead of a large dataset)
+    mask_fraction: 0.02           # swept 0.01/0.02/0.05/0.12 on real F3, scored by signal
+                                   # leakage: 0.02 -> 0.280, 0.12 -> 0.514. The old 0.12 was
+                                   # the worst setting tried. It does not buy supervision that
+                                   # matters (0.02 still gives ~48k supervised pixels/epoch);
+                                   # it just corrupts 12% of every input the model sees, while
+                                   # inference gets a clean one.
     neighborhood_radius: 5        # radius for the "swap" replacement strategy
   struct_n2v:
-    mask_fraction: 0.12
+    mask_fraction: 0.02
     blind_shape: "trace"          # "trace" (vertical stripe) | "horizontal" | "diagonal"
     blind_width: 3                # width of the blind stripe, in pixels
 
@@ -75,6 +78,10 @@ training:
     lambda_freq: 0.02              # dominate the reconstruction loss and destabilize training
                                     # on this small single-image dataset -- see README.
     freq_highpass_cutoff: 0.55    # fraction of Nyquist above which is "high frequency"
+    freq_floor_ratio: 0.6         # HF may fall to this fraction of the input before the
+                                   # term engages -- above the cutoff a noisy section is
+                                   # mostly noise, so matching the input there would ask
+                                   # the denoiser to keep it
   fault_preservation_enabled: true   # the on/off toggle from the demo script
   log_every: 5
   checkpoint_every: 10             # periodic resumable checkpoint (see --resume)
@@ -112,6 +119,7 @@ horizon:
   smoothness_weight: 0.5
 
 facies:
+  epochs: 24                      # was hardcoded at 6, which stopped the head underfit
   enabled: true
   n_classes: 6   # F3 Netherlands has 6 lithostratigraphic facies classes (0-5, Alaudah et al. 2019)
 

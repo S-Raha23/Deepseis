@@ -28,6 +28,15 @@ def generate_mask(shape: tuple[int, int], mask_fraction: float, rng: np.random.G
     return mask
 
 
+def _reflect(idx: np.ndarray, n: int) -> np.ndarray:
+    """Mirror out-of-range indices back inside [0, n-1] (numpy 'reflect' semantics)."""
+    if n == 1:
+        return np.zeros_like(idx)
+    period = 2 * (n - 1)
+    idx = np.abs(idx) % period
+    return np.where(idx >= n, period - idx, idx)
+
+
 def apply_blind_spot(patch: np.ndarray, mask: np.ndarray, neighborhood_radius: int,
                       rng: np.random.Generator) -> np.ndarray:
     """Replace masked pixels with the value of a random nearby pixel (the "UPS" strategy).
@@ -39,12 +48,35 @@ def apply_blind_spot(patch: np.ndarray, mask: np.ndarray, neighborhood_radius: i
     h, w = patch.shape
     out = patch.copy()
     ys, xs = np.nonzero(mask)
-    for y, x in zip(ys, xs):
-        dy = rng.integers(-neighborhood_radius, neighborhood_radius + 1)
-        dx = rng.integers(-neighborhood_radius, neighborhood_radius + 1)
-        ny = int(np.clip(y + dy, 0, h - 1))
-        nx = int(np.clip(x + dx, 0, w - 1))
-        out[y, x] = patch[ny, nx]
+    if ys.size == 0:
+        return out
+
+    # Draw a donor offset for every masked pixel, then reject any draw whose
+    # *resolved* donor is the masked pixel itself.
+    #
+    # Two distinct ways that happens, both of which defeat the blind spot -- and
+    # because the reconstruction loss is evaluated at exactly these pixels, a
+    # self-donation rewards the network for copying its input, the one thing
+    # blind-spot training exists to prevent:
+    #   * offset (0, 0), roughly 1 in 121 draws at radius 5;
+    #   * a border reflection landing back on the source, e.g. x=62 with dx=+2
+    #     reflects 64 -> 62 in a 64-wide patch.
+    # Testing the resolved index rather than the offset catches both at once.
+    # Reflection is used rather than clipping because clipping collapses every
+    # out-of-bounds offset onto the same edge pixel, biasing donors at the border.
+    r = neighborhood_radius
+    ny = np.empty_like(ys)
+    nx = np.empty_like(xs)
+    todo = np.ones(ys.shape, dtype=bool)
+    for _ in range(16):  # bounded; in practice one or two passes clear it
+        n = int(todo.sum())
+        if n == 0:
+            break
+        ny[todo] = _reflect(ys[todo] + rng.integers(-r, r + 1, size=n), h)
+        nx[todo] = _reflect(xs[todo] + rng.integers(-r, r + 1, size=n), w)
+        todo = (ny == ys) & (nx == xs)
+
+    out[ys, xs] = patch[ny, nx]
     return out
 
 

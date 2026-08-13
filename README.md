@@ -47,11 +47,54 @@ FaultSeg trains on a freshly generated synthetic volume and is applied to the re
 
 The facies head is fitted on F3's real labels with `python -m deepseis.fit_facies`, which
 trains only that head and leaves the denoiser and FaultSeg checkpoints alone. It reaches
-**90.4% pixel accuracy** on inline 0 — but that is the inline it was fitted on, so read it
-as goodness of fit, not generalization. Per-class IoU ranges from 96.5% (Upper North Sea)
-down to 0% for Triassic, which occupies 2.3% of the section and is never predicted; the
-Facies tab shows the per-class breakdown and an error map so this is visible rather than
-hidden behind one number.
+**94.4% pixel accuracy** on inline 0 — but that is the inline it was fitted on, so read it
+as goodness of fit, not generalization. All six units are predicted, including Triassic, which occupies
+just 2.3% of the section and previously scored 0% IoU — unweighted cross-entropy minimised
+total error by never predicting it, so the loss is now weighted by inverse class frequency.
+`facies.epochs` is also configurable; it was hardcoded at 6 with the loss still falling.
+The Facies tab shows a per-class breakdown and an error map, so failures stay visible rather
+than hidden behind one number.
+
+### Denoising quality, measured against controls
+
+Signal leakage (`metrics.local_similarity_map_fast`) is the correlation between what the
+denoiser removed and what it kept. Alone it is unreadable, so it is calibrated here against
+operations whose behaviour is known, on the same F3 section:
+
+| | leakage | gradient energy kept |
+|---|---|---|
+| identity (removes nothing) | 0.000 | 1.000 |
+| removes exactly the added noise (oracle) | 0.088 | — |
+| 9x9 box blur | 0.399 | — |
+| gaussian blur sigma=0.5 | 0.817 | 0.912 |
+| **denoiser before this work** | **0.814** | — |
+| **denoiser now, fault-preservation ON** | **0.334** | 0.962 |
+| denoiser now, fault-preservation OFF | 0.360 | 0.973 |
+
+The previous denoiser scored what a mild gaussian blur scores: it was smoothing, not
+denoising. It also *amplified* — output std 1.247 against an input of 1.000. Five defects
+caused that, all fixed:
+
+- **The blind spot was not blind.** `apply_blind_spot` could draw offset (0, 0), and border
+  handling (first `clip`, then even `reflect`, which has fixed points) could resolve back
+  onto the source. About 0.93% of masked pixels were replaced by themselves — and the
+  reconstruction loss is evaluated at exactly those pixels, so the network was rewarded for
+  copying its input. Now rejected on the resolved donor index: 0 self-donations in 196,800.
+- **The edge loss was anchored to noisy gradients.** Noise inflates gradient magnitude, so
+  "do not fall below the reference gradient" instructed the model to keep the noise. Edge
+  locations and target magnitudes now come from a de-spiked reference, and only edge
+  *weakening* is penalised.
+- **The F-K loss matched the noisy spectrum**, where energy above the cutoff is mostly noise.
+  Now one-sided against a floor (`freq_floor_ratio`).
+- **`mask_fraction: 0.12`** was the worst of the four values swept (0.514 vs 0.280 at 0.02).
+  It corrupts 12% of every training input while inference sees a clean one, and 0.02 still
+  supplies ~48k supervised pixels per epoch.
+- **The field volume was never normalised in training** while the dashboard normalises at
+  serve time — a 4.4x scale mismatch.
+
+Fault-preservation ON now beats OFF on leakage at every mask fraction tested. Before this
+work it was inverted (0.814 ON vs 0.456 OFF) — the loss meant to protect geology was
+removing more of it.
 
 > To use synthetic data instead, set `data.use_synthetic: true` in `configs/default.yaml`. This enables exact PSNR/SSIM/Dice scoring against a known-clean reference.
 
