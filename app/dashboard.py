@@ -1,21 +1,14 @@
 """
-DeepSeis dashboard — real post-stack seismic surveys
+DeepSeis dashboard — F3 Netherlands real data
 Fault-preserving self-supervised seismic denoising & auto-interpretation.
-
-The survey shown is chosen from the sidebar and comes from the ``datasets:``
-registry in the config (F3 Netherlands by default, Parihaka as a second option).
-Every registered survey is stored in the same canonical layout, so each tab reads
-whichever one is selected without any per-survey special-casing.
 
 Run with:
     streamlit run app/dashboard.py
 """
 from __future__ import annotations
 
-import copy
 import io
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -49,91 +42,40 @@ FACIES_COLORS = ["#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00", "#a65628
 # Cached loaders
 # ---------------------------------------------------------------------------
 
-REPO_ROOT = Path(__file__).parent.parent
-
-
+@st.cache_data(show_spinner=False)
 def load_cfg(config_path: str) -> dict:
-    """Parse the config. Deliberately NOT cached.
-
-    It was previously wrapped in @st.cache_data keyed on the path string alone.
-    That key never changes, so when Streamlit Cloud pulled new code and re-ran
-    the script in a still-warm process, it returned the config parsed *before*
-    the deploy -- new code reading an old config, which crashed with a KeyError
-    the moment the code expected a config section the cached copy predated.
-    Parsing a few KB of YAML is far cheaper than that failure mode, and every
-    caller that actually does expensive work is cached in its own right.
-    """
     return load_config(config_path)
 
 
 @st.cache_data(show_spinner=False)
-def resolve_dataset(config_path: str, dataset_key: str) -> tuple[str, str, str]:
-    """Locate a registered survey's (seismic, labels) files. Returns (seismic, labels, origin).
-
-    Local copies are preferred so that a machine which has already run the
-    survey's download script never re-downloads; otherwise the file is pulled
-    from the survey's Hugging Face mirror (the only route that works on
-    Streamlit Cloud, where ``data/raw/`` does not exist).
-    """
-    spec = load_cfg(config_path)["datasets"][dataset_key]
-    repo_root = Path(__file__).parent.parent
-
-    local_seismic = repo_root / spec["local_seismic"]
-    local_labels = repo_root / spec["local_labels"]
-    if local_seismic.exists() and local_labels.exists():
-        return str(local_seismic), str(local_labels), "local"
-
+def fetch_f3_from_hf() -> tuple[str, str]:
     from huggingface_hub import hf_hub_download
-    # tempfile.gettempdir() rather than a hardcoded "/tmp" so this also works on Windows.
-    cache_dir = Path(tempfile.gettempdir()) / "deepseis_data" / dataset_key
-    seismic_path = hf_hub_download(repo_id=spec["hf_repo"], filename=spec["hf_seismic"],
-                                    repo_type="dataset", local_dir=str(cache_dir))
-    labels_path = hf_hub_download(repo_id=spec["hf_repo"], filename=spec["hf_labels"],
-                                   repo_type="dataset", local_dir=str(cache_dir))
-    return seismic_path, labels_path, "huggingface"
-
-
-def read_inline(seismic_path: str, idx: int) -> np.ndarray:
-    """One inline as (n_samples, n_traces) float32, normalized to unit std.
-
-    Memory-mapped: touches roughly one inline's worth of bytes rather than the
-    whole cube. This matters more than it looks. The dashboard only ever
-    *displays* a single inline, but the previous implementations materialized
-    the entire volume to get one -- F3 is 573 MB on disk as float64 and Parihaka
-    465 MB, which drove resident memory to 1.4 GB on first render and 3.4 GB
-    after switching surveys, over the cap on a hosted runner and killed without
-    a Python traceback.
-
-    Normalizing by the section's own std (rather than the whole volume's) also
-    matches how ``train.prepare_data`` normalized the training section, so the
-    denoiser sees inputs on the scale it was actually fitted at.
-    """
-    if seismic_path.endswith(".npy"):
-        vol = np.load(seismic_path, mmap_mode="r")
-        section = np.asarray(vol[idx], dtype=np.float32).T
-    else:  # SEG-Y / .dat have no mmap path -- fall back to a full read
-        section = segy_mod.load_volume(seismic_path)[idx].astype(np.float32).T
-    return section / (float(section.std()) + 1e-8)
+    seismic_path = hf_hub_download(
+        repo_id="SRaha23/f3-netherlands", filename="train_seismic.npy",
+        repo_type="dataset", local_dir="/tmp/f3",
+    )
+    labels_path = hf_hub_download(
+        repo_id="SRaha23/f3-netherlands", filename="train_labels.npy",
+        repo_type="dataset", local_dir="/tmp/f3",
+    )
+    return seismic_path, labels_path
 
 
 @st.cache_data(show_spinner=False)
-def volume_shape(config_path: str, dataset_key: str) -> tuple[int, ...]:
-    """Volume dimensions, without reading the samples."""
-    seismic_path, _, _ = resolve_dataset(config_path, dataset_key)
-    if seismic_path.endswith(".npy"):
-        return tuple(np.load(seismic_path, mmap_mode="r").shape)
-    return tuple(segy_mod.load_volume(seismic_path).shape)
-
-
-@st.cache_data(show_spinner=False)
-def get_demo_section(config_path: str, dataset_key: str):
+def get_demo_section(config_path: str):
     cfg = load_cfg(config_path)
     dcfg = cfg["data"]
     if not dcfg.get("use_synthetic", True):
-        seismic_path, labels_path, _ = resolve_dataset(config_path, dataset_key)
-        noisy = read_inline(seismic_path, 0)
+        seismic_path, labels_path = fetch_f3_from_hf()
+        noisy_raw = segy_mod.load_volume(seismic_path)
+        if noisy_raw.ndim == 3:
+            noisy_raw = noisy_raw[0].T
+        noisy = noisy_raw.astype("float32")
+        std = noisy.std()
+        if std > 0:
+            noisy = noisy / std
         labels_vol = np.load(labels_path, mmap_mode="r")
-        facies = np.asarray(labels_vol[0]).T.astype(np.int64)
+        facies = labels_vol[0].T.astype(np.int64)
         return None, noisy, None, facies
     rng = np.random.default_rng(dcfg["synthetic"]["random_seed"])
     vol = synth_mod.generate_from_config(cfg)
@@ -146,13 +88,21 @@ def get_survey(config_path: str, n_inlines: int):
     return synth_mod.generate_synthetic_survey(n_inlines=n_inlines, random_seed=7)
 
 
+@st.cache_data(show_spinner=False)
+def load_f3_full() -> np.ndarray:
+    seismic_path, _ = fetch_f3_from_hf()
+    vol = segy_mod.load_volume(seismic_path)
+    std = vol.std()
+    return (vol / (std + 1e-8)).astype("float32")
+
+
 def checkpoints_exist(run_dir: Path, cfg: dict) -> bool:
     return (run_dir / cfg["output"]["checkpoint_name"]).exists() and \
            (run_dir / ("off_" + cfg["output"]["checkpoint_name"])).exists()
 
 
 @st.cache_resource(show_spinner=False)
-def load_models(config_path: str, run_dir_str: str, n_classes: int = 6):
+def load_models(config_path: str, run_dir_str: str):
     cfg = load_cfg(config_path)
     run_dir = Path(run_dir_str)
     device = get_device(cfg)
@@ -177,9 +127,7 @@ def load_models(config_path: str, run_dir_str: str, n_classes: int = 6):
     facies_path = run_dir / "facies.pt"
     if facies_path.exists():
         try:
-            # n_classes comes from the survey being loaded, not the global default:
-            # train_facies sizes the head from the labels it saw, so a survey with a
-            # different class count would otherwise fail the shape check below.
+            n_classes = cfg["facies"].get("n_classes", 6)
             facies_model = FaciesNet2D(in_channels=1, n_classes=n_classes,
                                         base_channels=cfg["faultseg"]["base_channels"],
                                         depth=cfg["faultseg"]["depth"]).to(device)
@@ -188,7 +136,7 @@ def load_models(config_path: str, run_dir_str: str, n_classes: int = 6):
         except Exception:
             facies_model = None  # checkpoint mismatch — will show retrain prompt in tab
 
-    return model_on, model_off, faultseg, facies_model, device
+    return model_on, model_off, faultseg, device
 
 
 @torch.no_grad()
@@ -200,14 +148,9 @@ def run_facies_inference(model: FaciesNet2D, section: np.ndarray, cfg: dict, dev
     pcfg = cfg["data"]["patch"]
     h, w = section.shape
     patches = patch_mod.extract_patches(section, pcfg["size"], pcfg["stride"])
-    # Batched for the same reason as the denoiser and fault heads -- see
-    # INFERENCE_BATCH in deepseis/train.py. argmax is taken per chunk so the
-    # (N, n_classes, 64, 64) logits never exist for the whole section at once.
-    from deepseis.train import INFERENCE_BATCH
-    preds = np.concatenate([
-        model(to_tensor(patches[i:i + INFERENCE_BATCH], device)).argmax(dim=1).detach().cpu().numpy()
-        for i in range(0, len(patches), INFERENCE_BATCH)
-    ], axis=0)
+    x = to_tensor(patches, device)
+    logits = model(x)
+    preds = logits.argmax(dim=1).detach().cpu().numpy()
     coords = patch_coords(h, w, pcfg["size"], pcfg["stride"])
     out = np.zeros((h, w), dtype=np.int32)
     count = np.zeros((h, w), dtype=np.int32)
@@ -218,26 +161,14 @@ def run_facies_inference(model: FaciesNet2D, section: np.ndarray, cfg: dict, dev
     return (out // count).astype(np.int32)
 
 
-def run_training(config_path: str, run_dir: Path, dataset_key: str) -> None:
-    """Retrain the denoiser + FaultSeg head for one survey, into that survey's run_dir."""
-    cfg = copy.deepcopy(load_cfg(config_path))
-    spec = cfg["datasets"][dataset_key]
-
-    # Point the config at the selected survey. resolve_dataset() is used rather than
-    # the registry's local_* paths directly, because on Streamlit Cloud the only copy
-    # of the data is the Hugging Face mirror it downloads into a temp dir.
-    if not cfg["data"].get("use_synthetic", True):
-        seismic_path, labels_path, _ = resolve_dataset(config_path, dataset_key)
-        cfg["data"]["field_volume_path"] = seismic_path
-        cfg["data"]["facies_label_path"] = labels_path
-    cfg["facies"]["n_classes"] = spec.get("n_facies", cfg["facies"]["n_classes"])
-
+def run_training(config_path: str, run_dir: Path) -> None:
+    cfg = load_cfg(config_path)
     device = get_device(cfg)
     set_seed(cfg["seed"])
     run_dir.mkdir(parents=True, exist_ok=True)
     from deepseis.train import prepare_data as _prepare_data
 
-    st.info(f"⏳ Preparing {spec['label']} data...")
+    st.info("⏳ Preparing data...")
     data = _prepare_data(cfg)
     noisy = data["noisy"]
     syn_clean = data["syn_clean"]
@@ -297,117 +228,60 @@ def facies_heatmap(class_map: np.ndarray, title: str, n_classes: int) -> go.Figu
 # Sidebar
 # ---------------------------------------------------------------------------
 
-# Absolute, so the app does not depend on the working directory it was launched from.
-config_path = str(REPO_ROOT / "configs" / "default.yaml")
-cfg = load_cfg(config_path)
-is_real_data = not cfg["data"].get("use_synthetic", True)
-
-DATASETS = cfg.get("datasets", {})
-DATASET_KEYS = [k for k in DATASETS if k != "default"]
-
-if not DATASET_KEYS:
-    # Never index into an empty registry -- that surfaced as a bare KeyError with
-    # no indication of the cause. Say what is wrong and where to look instead.
-    st.error(
-        f"**No surveys are registered.** `{config_path}` has no usable `datasets:` section, "
-        f"so there is nothing to display.\n\n"
-        f"Found top-level config keys: `{', '.join(sorted(cfg)) or '(none)'}`.\n\n"
-        f"If this app was just redeployed, restart it from **Manage app → Reboot** — a warm "
-        f"process can otherwise keep serving a configuration parsed before the deploy."
-    )
-    st.stop()
-
 st.sidebar.title("\U0001FAA8 DeepSeis")
 st.sidebar.caption("Fault-preserving self-supervised seismic denoising & auto-interpretation")
-
-# ---- Survey selection -----------------------------------------------------
-st.sidebar.markdown("#### Survey")
-_default_key = DATASETS.get("default", "f3")
-dataset_key = st.sidebar.selectbox(
-    "Survey",
-    DATASET_KEYS,
-    index=DATASET_KEYS.index(_default_key) if _default_key in DATASET_KEYS else 0,
-    format_func=lambda k: DATASETS[k]["label"],
-    label_visibility="collapsed",
-    help="Switch the survey every tab operates on. The denoiser is self-supervised, "
-         "so it adapts to whichever survey's noise you point it at — use Retrain "
-         "below to fit it to the selected one.",
-)
-ds = DATASETS[dataset_key]
-DATASET_LABEL = ds["label"]
-# Each survey has its own checkpoints -- see `run_dir` in the registry.
-run_dir = Path(ds.get("run_dir", cfg["output"]["run_dir"]))
-
 st.sidebar.success(
-    f"📡 **{DATASET_LABEL}** — {ds['region']}\n\n"
-    f"{ds['citation']}\n\n"
-    f"{ds['geometry']}"
+    "📡 **Real data:** F3 Netherlands block\n\n"
+    "Alaudah et al. 2019 · Zenodo 3755060\n"
+    "401 inlines · 701 crosslines · 255 samples"
 )
 
-st.sidebar.markdown("---")
+config_path = "configs/default.yaml"
+cfg = load_cfg(config_path)
+run_dir = Path(cfg["output"]["run_dir"])
+is_real_data = not cfg["data"].get("use_synthetic", True)
+
 fault_preservation_view = st.sidebar.radio("Fault-preservation loss", ["ON", "OFF", "Side-by-side"], index=2)
 dice_threshold = st.sidebar.slider("Fault probability threshold", 0.1, 0.9,
                                     cfg["faultseg"]["dice_threshold"], 0.05)
 st.sidebar.markdown("---")
-if st.sidebar.button(f"🔄 Retrain on {DATASET_LABEL}"):
-    run_training(config_path, run_dir, dataset_key)
+if st.sidebar.button("🔄 Retrain models from scratch"):
+    run_training(config_path, run_dir)
     st.rerun()
 st.sidebar.caption(
-    f"Running on the **{DATASET_LABEL}** survey ({ds['region']}) — "
-    f"real post-stack seismic · self-supervised denoiser · FaultSeg3D workflow · "
-    f"real {ds['n_facies']}-class facies labels."
+    "Running on the **F3 Netherlands block** (Alaudah et al. 2019, Zenodo) — "
+    "real post-stack seismic · self-supervised denoiser · FaultSeg3D workflow · "
+    "real 6-class facies labels."
 )
 
 # ---------------------------------------------------------------------------
 # STARTUP LOADING SCREEN — runs once, shows progress, then renders the dashboard
 # ---------------------------------------------------------------------------
 
-tab_denoise, tab_fault, tab_survey, tab_facies, tab_export, tab_diag = st.tabs([
-    "🧮 Denoise", "🧩 Fault segmentation", "🗺️ Survey explorer",
-    "🌊 Facies", "📤 Export", "🔬 Diagnostics",
+tab_denoise, tab_fault, tab_survey, tab_export, tab_diag = st.tabs([
+    "🧮 Denoise", "🧩 Fault segmentation", "🗺️ F3 Survey explorer",
+    "📤 Export", "🔬 Diagnostics",
 ])
 
 # ── Step 1: load data ───────────────────────────────────────────────────────
 if not checkpoints_exist(run_dir, cfg):
-    # Deliberately does NOT auto-train: fitting a survey takes tens of minutes on
-    # CPU, which is not something to start silently inside a page load. Offer the
-    # command and an explicit button instead.
-    st.warning(
-        f"**No trained checkpoints for {DATASET_LABEL}** (looked in `{run_dir}`).\n\n"
-        f"Train it from the command line — much faster than in-browser, and resumable:\n\n"
-        f"```\npython -m deepseis.train --config {config_path} --dataset {dataset_key}\n```\n\n"
-        f"Or use **🔄 Retrain on {DATASET_LABEL}** in the sidebar to run it here. "
-        f"Meanwhile you can switch to another survey in the sidebar."
-    )
-    st.stop()
+    st.warning("No trained checkpoints found. Training now — this takes a few minutes...")
+    run_training(config_path, run_dir)
+    st.rerun()
 
 startup_progress = st.empty()
 startup_status = st.empty()
 
 if is_real_data:
     with startup_progress.container():
-        prog = st.progress(0, text=f"📡 Step 1 / 3 — Loading {DATASET_LABEL} survey data...")
+        prog = st.progress(0, text="📡 Step 1 / 3 — Downloading F3 Netherlands data from Hugging Face (~640 MB)...")
     with startup_status.container():
-        st.info(f"Fetching `{ds['hf_seismic']}` and `{ds['hf_labels']}` for **{DATASET_LABEL}** — "
-                f"from `data/raw/` if present, otherwise from `{ds['hf_repo']}` on Hugging Face. "
-                f"This only happens once per session.")
-    try:
-        clean, noisy, fault_mask, facies_labels = get_demo_section(config_path, dataset_key)
-    except Exception as exc:
-        startup_progress.empty()
-        startup_status.empty()
-        st.error(
-            f"**Could not load the {DATASET_LABEL} survey.**\n\n"
-            f"`{type(exc).__name__}: {exc}`\n\n"
-            f"Fetch it locally with `python data/download_{dataset_key}.py`, or publish the "
-            f"mirror it expects with `python data/mirror_to_hf.py --dataset {dataset_key}`. "
-            f"Pick another survey in the sidebar to carry on in the meantime."
-        )
-        st.stop()
+        st.info("Fetching `train_seismic.npy` and `train_labels.npy` from `SRaha23/f3-netherlands` on Hugging Face. This only happens once per session.")
+    clean, noisy, fault_mask, facies_labels = get_demo_section(config_path)
 else:
     with startup_progress.container():
         prog = st.progress(0, text="🧪 Step 1 / 3 — Generating synthetic seismic section (701×255)...")
-    clean, noisy, fault_mask, facies_labels = get_demo_section(config_path, dataset_key)
+    clean, noisy, fault_mask, facies_labels = get_demo_section(config_path)
 
 # fallback if data still None
 if noisy is None:
@@ -425,8 +299,7 @@ startup_status.empty()
 
 # ── Step 2: load models ─────────────────────────────────────────────────────
 load_prog = st.progress(33, text="⚙️ Step 2 / 3 — Loading pre-trained model checkpoints...")
-model_on, model_off, faultseg, facies_model, device = load_models(
-    config_path, str(run_dir), ds.get("n_facies", cfg["facies"].get("n_classes", 6)))
+model_on, model_off, faultseg, device = load_models(config_path, str(run_dir))
 load_prog.progress(66, text="🧠 Step 3 / 3 — Running denoiser inference on seismic section...")
 
 # ── Step 3: run inference ───────────────────────────────────────────────────
@@ -443,23 +316,23 @@ load_prog.empty()
 # ---------------------------------------------------------------------------
 
 with tab_denoise:
-    st.subheader(f"{DATASET_LABEL} — Noisy → Denoised, fault-preservation loss toggled")
+    st.subheader("F3 Netherlands — Noisy → Denoised, fault-preservation loss toggled")
     cols = st.columns(3 if fault_preservation_view == "Side-by-side" else 2)
     with cols[0]:
-        st.plotly_chart(seismic_heatmap(noisy, f"{DATASET_LABEL} raw input (inline 0)"),
-                        width='stretch', key="denoise_noisy")
+        st.plotly_chart(seismic_heatmap(noisy, "F3 raw input (inline 0)"),
+                        use_container_width=True, key="denoise_noisy")
     if fault_preservation_view == "Side-by-side":
         with cols[1]:
             st.plotly_chart(seismic_heatmap(denoised_off, "Denoised — fault-preservation OFF"),
-                            width='stretch', key="denoise_off")
+                            use_container_width=True, key="denoise_off")
         with cols[2]:
             st.plotly_chart(seismic_heatmap(denoised_on, "Denoised — fault-preservation ON"),
-                            width='stretch', key="denoise_on")
+                            use_container_width=True, key="denoise_on")
     else:
         shown = denoised_on if fault_preservation_view == "ON" else denoised_off
         with cols[1]:
             st.plotly_chart(seismic_heatmap(shown, f"Denoised — fault-preservation {fault_preservation_view}"),
-                            width='stretch', key="denoise_single")
+                            use_container_width=True, key="denoise_single")
 
     st.markdown("**\"Ordinary denoisers erase the geology. Ours protects it.\"** — toggle above to see it live.")
 
@@ -469,7 +342,7 @@ with tab_denoise:
 # ---------------------------------------------------------------------------
 
 with tab_fault:
-    st.subheader(f"Fault segmentation — noisy vs. denoised {DATASET_LABEL} input")
+    st.subheader("Fault segmentation — noisy vs. denoised F3 input")
     if faultseg is None:
         st.warning("No FaultSeg checkpoint found — use the Retrain button in the sidebar.")
     else:
@@ -479,14 +352,14 @@ with tab_fault:
 
         cols = st.columns(3)
         with cols[0]:
-            st.plotly_chart(seismic_heatmap(noisy, f"{DATASET_LABEL} raw input"),
-                            width='stretch', key="fault_noisy")
+            st.plotly_chart(seismic_heatmap(noisy, "F3 raw input"),
+                            use_container_width=True, key="fault_noisy")
         with cols[1]:
             st.plotly_chart(overlay_heatmap(noisy, prob_noisy, "Fault picks — NOISY", threshold=dice_threshold),
-                            width='stretch', key="fault_overlay_noisy")
+                            use_container_width=True, key="fault_overlay_noisy")
         with cols[2]:
             st.plotly_chart(overlay_heatmap(denoised_on, prob_denoised, "Fault picks — DENOISED", threshold=dice_threshold),
-                            width='stretch', key="fault_overlay_denoised")
+                            use_container_width=True, key="fault_overlay_denoised")
 
         st.markdown("#### Fault-segmentation metrics")
         if fault_mask is not None:
@@ -496,10 +369,10 @@ with tab_fault:
                 "Noisy input":   [fm_n.dice, fm_n.precision, fm_n.recall, fm_n.roc_auc, fm_n.mean_distance_error],
                 "Denoised input":[fm_d.dice, fm_d.precision, fm_d.recall, fm_d.roc_auc, fm_d.mean_distance_error],
             }, index=["Dice","Precision","Recall","ROC-AUC","Mean distance error (px ↓)"])
-            st.dataframe(df.style.format("{:.3f}"), width='stretch')
+            st.dataframe(df.style.format("{:.3f}"), use_container_width=True)
             st.caption("\"Denoising isn't the goal — finding the trap is, and we find more of them.\"")
         else:
-            # No ground-truth fault labels for real surveys — compute self-referential quality metrics
+            # No ground-truth fault labels for F3 — compute self-referential quality metrics
             # from the probability maps: confidence, coverage, contrast, and SNR of the fault signal
             def _fault_map_metrics(prob: np.ndarray, threshold: float, label: str) -> dict:
                 binary = prob >= threshold
@@ -576,16 +449,14 @@ with tab_fault:
 # ---------------------------------------------------------------------------
 
 with tab_survey:
-    st.subheader(f"{DATASET_LABEL} — scrub through real inlines")
+    st.subheader("F3 Netherlands — scrub through real inlines")
     if is_real_data:
-        # Only the shape is needed to build the slider; the samples stay on disk
-        # until an inline is actually requested.
-        n_inlines_real = volume_shape(config_path, dataset_key)[0]
-        inline_idx = st.slider(f"Inline ({DATASET_LABEL})", 0, n_inlines_real - 1, n_inlines_real // 2,
-                                help=f"Scrub through all {n_inlines_real} real inlines.")
-        seismic_path, _, _ = resolve_dataset(config_path, dataset_key)
-        with st.spinner(f"Reading inline {inline_idx}..."):
-            section_noisy = read_inline(seismic_path, inline_idx)
+        with st.spinner("Loading full F3 volume (401 inlines × 701 × 255) — cached after first load..."):
+            f3_vol = load_f3_full()
+        n_inlines_f3 = f3_vol.shape[0]
+        inline_idx = st.slider("Inline (F3 Netherlands)", 0, n_inlines_f3 - 1, n_inlines_f3 // 2,
+                                help="Scrub through all 401 real inlines.")
+        section_noisy    = f3_vol[inline_idx].T
         with st.spinner(f"Running denoiser on inline {inline_idx}..."):
             section_denoised = run_denoiser_inference(model_on, section_noisy, cfg, device)
     else:
@@ -599,10 +470,10 @@ with tab_survey:
     cols = st.columns(3)
     with cols[0]:
         st.plotly_chart(seismic_heatmap(section_noisy,    f"Inline {inline_idx} — raw"),
-                        width='stretch', key="survey_noisy")
+                        use_container_width=True, key="survey_noisy")
     with cols[1]:
         st.plotly_chart(seismic_heatmap(section_denoised, f"Inline {inline_idx} — denoised"),
-                        width='stretch', key="survey_denoised")
+                        use_container_width=True, key="survey_denoised")
     with cols[2]:
         if faultseg is not None:
             prob = run_faultseg_inference(faultseg, section_denoised, cfg, device)
@@ -612,134 +483,43 @@ with tab_survey:
                                            fault_mask=prob >= dice_threshold)
                 for h in horizons:
                     fig.add_trace(go.Scatter(y=h, mode="lines", line=dict(width=2), showlegend=False))
-            st.plotly_chart(fig, width='stretch', key="survey_interpreted")
+            st.plotly_chart(fig, use_container_width=True, key="survey_interpreted")
         else:
             st.plotly_chart(seismic_heatmap(section_denoised, "Interpreted (retrain FaultSeg to enable)"),
-                            width='stretch', key="survey_interp_placeholder")
+                            use_container_width=True, key="survey_interp_placeholder")
 
     if is_real_data:
-        st.caption(f"**Survey:** {DATASET_LABEL} ({ds['region']}) · "
-                   f"[{ds['citation']}]({ds['citation_url']}) · "
-                   f"{ds['geometry']} at {ds['dt_ms']} ms.")
+        st.caption("**Dataset:** F3 Netherlands · Alaudah et al. 2019 · [Zenodo 3755060](https://zenodo.org/record/3755060) · 401 inlines · 701 crosslines · 255 samples at 4 ms.")
 
 
 # ---------------------------------------------------------------------------
-# Tab 4: Facies
-# ---------------------------------------------------------------------------
-
-with tab_facies:
-    n_facies = ds.get("n_facies", cfg["facies"].get("n_classes", 6))
-    class_names = ds.get("facies_names", [f"Class {i}" for i in range(n_facies)])
-    st.subheader(f"Facies segmentation — {DATASET_LABEL} lithostratigraphic labels "
-                 f"({n_facies} classes)")
-
-    if facies_model is None:
-        st.warning(
-            f"**No facies checkpoint for {DATASET_LABEL}** (looked for `{run_dir / 'facies.pt'}`).\n\n"
-            f"Train it with:\n\n"
-            f"```\npython -m deepseis.train --config {config_path} --dataset {dataset_key}\n```"
-        )
-    else:
-        with st.spinner("Running facies inference on the denoised section..."):
-            facies_map = run_facies_inference(facies_model, denoised_on, cfg, device)
-
-        # Ground truth is available for both registered surveys, so show the
-        # prediction against it rather than alone -- a facies map on its own
-        # looks plausible even when it is wrong.
-        has_gt = facies_labels is not None and facies_labels.shape == facies_map.shape
-        cols = st.columns(3 if has_gt else 2)
-        with cols[0]:
-            st.plotly_chart(seismic_heatmap(denoised_on, "Denoised seismic (inline 0)"),
-                            width='stretch', key="facies_seismic")
-        with cols[1]:
-            st.plotly_chart(facies_heatmap(facies_map, "Predicted facies", n_facies),
-                            width='stretch', key="facies_map")
-        if has_gt:
-            with cols[2]:
-                st.plotly_chart(facies_heatmap(facies_labels, "Ground-truth facies", n_facies),
-                                width='stretch', key="facies_gt")
-
-        if has_gt:
-            accuracy = float((facies_map == facies_labels).mean())
-            # Mean per-class IoU, computed only over classes actually present in
-            # this inline -- averaging in absent classes as zeros would understate
-            # the result for a section that simply does not intersect them.
-            ious = []
-            for c in range(n_facies):
-                pred_c, gt_c = facies_map == c, facies_labels == c
-                union = np.logical_or(pred_c, gt_c).sum()
-                if union > 0:
-                    ious.append(np.logical_and(pred_c, gt_c).sum() / union)
-            m1, m2 = st.columns(2)
-            m1.metric("Pixel accuracy (fit)", f"{accuracy * 100:.1f}%",
-                       help="Measured on inline 0 — the same section the head was trained on. "
-                            "This is goodness of fit, not generalization.")
-            m2.metric("Mean IoU (fit)", f"{np.mean(ious) * 100:.1f}%" if ious else "—",
-                       help="Averaged over the classes present in this inline.")
-            st.warning(
-                "**These are training-set scores.** The facies head is fitted on inline 0 only "
-                "(`train.prepare_data` takes a single section), and this tab scores it on that "
-                "same inline. Measured on held-out inlines of Parihaka, accuracy falls from ~79% "
-                "to ~42–50%. Treat the map as a qualitative interpretation aid, not a validated "
-                "classifier — training across multiple inlines would be needed for the latter."
-            )
-
-        rows = []
-        for c in range(n_facies):
-            name = class_names[c] if c < len(class_names) else f"Class {c}"
-            pred_px = int((facies_map == c).sum())
-            row = {"Class": f"{c} — {name}",
-                   "Predicted (%)": f"{100 * pred_px / facies_map.size:.1f}"}
-            if has_gt:
-                gt_px = int((facies_labels == c).sum())
-                row["Actual (%)"] = f"{100 * gt_px / facies_labels.size:.1f}"
-                inter = int(np.logical_and(facies_map == c, facies_labels == c).sum())
-                union = int(np.logical_or(facies_map == c, facies_labels == c).sum())
-                row["IoU (%)"] = f"{100 * inter / union:.1f}" if union else "—"
-            rows.append(row)
-        st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
-
-        st.caption(f"**{DATASET_LABEL} class legend:** "
-                   + " · ".join(f"{i} = {n}" for i, n in enumerate(class_names)))
-        if has_gt:
-            st.info(
-                f"The facies head is trained on this survey's own published labels "
-                f"({ds['citation']}), then applied to the *denoised* section. Classes absent "
-                f"from inline 0 are shown as 0% — that is the section not intersecting them, "
-                f"not a prediction failure."
-            )
-
-
-# ---------------------------------------------------------------------------
-# Tab 5: Export
+# Tab 4: Export
 # ---------------------------------------------------------------------------
 
 with tab_export:
-    st.subheader(f"Export denoised {DATASET_LABEL} section")
+    st.subheader("Export denoised F3 section")
     st.markdown("Download the denoised inline 0. SEG-Y preserves standard headers for OpendTect / Petrel / Kingdom.")
     export_format = st.radio("Format", ["SEG-Y (.sgy)", "NumPy (.npy)"], horizontal=True)
-    # Name the file after the survey so exports from two surveys don't collide.
-    export_stem = f"{dataset_key}_denoised_inline0"
     if st.button("Generate export"):
         if export_format == "NumPy (.npy)":
             buf = io.BytesIO()
             np.save(buf, denoised_on)
             buf.seek(0)
-            st.download_button(f"⬇️ Download {export_stem}.npy", buf,
-                               file_name=f"{export_stem}.npy", mime="application/octet-stream")
+            st.download_button("⬇️ Download denoised_inline0.npy", buf,
+                               file_name="denoised_inline0.npy", mime="application/octet-stream")
         else:
-            import os
+            import tempfile, os
             buf = io.BytesIO()
             with tempfile.NamedTemporaryFile(suffix=".sgy", delete=False) as tmp:
                 tmp_path = tmp.name
             try:
                 segy_mod.write_segy_like(tmp_path, denoised_on, template_path=None,
-                                          dt_ms=ds["dt_ms"])
+                                          dt_ms=cfg["data"]["synthetic"]["dt_ms"])
                 with open(tmp_path, "rb") as f:
                     buf.write(f.read())
                 buf.seek(0)
-                st.download_button(f"⬇️ Download {export_stem}.sgy", buf,
-                                   file_name=f"{export_stem}.sgy", mime="application/octet-stream")
+                st.download_button("⬇️ Download denoised_inline0.sgy", buf,
+                                   file_name="denoised_inline0.sgy", mime="application/octet-stream")
             finally:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
@@ -748,7 +528,7 @@ with tab_export:
     st.markdown("---")
     st.markdown("#### Denoised section preview")
     st.plotly_chart(seismic_heatmap(denoised_on, "Denoised inline 0 — fault-preservation ON"),
-                    width='stretch', key="export_preview")
+                    use_container_width=True, key="export_preview")
     st.caption(f"Shape: {denoised_on.shape[0]} samples × {denoised_on.shape[1]} traces | "
                f"Range: [{denoised_on.min():.3f}, {denoised_on.max():.3f}]")
 
@@ -768,11 +548,11 @@ with tab_diag:
     with cols[0]:
         st.plotly_chart(go.Figure(go.Heatmap(z=fk_noisy, colorscale="Viridis"))
                         .update_layout(title="F-K — raw", height=350, margin=dict(l=10,r=10,t=40,b=10)),
-                        width='stretch', key="diag_fk_noisy")
+                        use_container_width=True, key="diag_fk_noisy")
     with cols[1]:
         st.plotly_chart(go.Figure(go.Heatmap(z=fk_denoised, colorscale="Viridis"))
                         .update_layout(title="F-K — denoised", height=350, margin=dict(l=10,r=10,t=40,b=10)),
-                        width='stretch', key="diag_fk_denoised")
+                        use_container_width=True, key="diag_fk_denoised")
 
     st.markdown("#### Signal-leakage map — no geology removed")
     st.caption("Values near zero = removed component is noise, not geology.")
@@ -781,7 +561,7 @@ with tab_diag:
     st.plotly_chart(go.Figure(go.Heatmap(z=sim_map, colorscale="RdBu", zmid=0, zmin=-1, zmax=1))
                     .update_layout(title="Local correlation: (noisy − denoised) vs. denoised", height=380,
                                    yaxis=dict(autorange="reversed"), margin=dict(l=10,r=10,t=40,b=10)),
-                    width='stretch', key="diag_sim_map")
+                    use_container_width=True, key="diag_sim_map")
 
     st.markdown("#### Jacobian mask explainer")
     st.caption("Pick a pixel — see which inputs the denoiser relies on and what blind-spot mask that implies.")
@@ -802,7 +582,7 @@ with tab_diag:
             st.plotly_chart(go.Figure(go.Heatmap(z=jac, colorscale="Inferno"))
                             .update_layout(title="Sensitivity |d(output)/d(input)|", height=350,
                                            margin=dict(l=10,r=10,t=40,b=10)),
-                            width='stretch', key="diag_jacobian")
+                            use_container_width=True, key="diag_jacobian")
         with c2:
             st.write(f"**Suggested blind shape:** `{suggestion.suggested_blind_shape}`")
             st.write(f"**Suggested blind width:** `{suggestion.suggested_blind_width}` px")

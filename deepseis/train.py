@@ -107,22 +107,6 @@ def prepare_data(cfg: dict) -> dict:
         noisy = noisy.astype(np.float32)
         print(f"[deepseis] loaded field volume from {dcfg['field_volume_path']}, shape={noisy.shape}")
 
-        # Normalize to unit std. This is REQUIRED, not cosmetic: surveys are published
-        # at wildly different amplitude scales (F3 ships pre-scaled to [-1, 1] with
-        # std ~0.23; Parihaka ships raw with std ~366, a factor of ~1600), and the
-        # loss weights, learning rate and the lambda_edge/lambda_freq balance are all
-        # tuned for unit-scale data -- raw Parihaka amplitudes diverge immediately.
-        #
-        # It is also what makes training agree with inference: `infer.py` and the
-        # dashboard both divide the input by its std before calling the model, so
-        # without this the model would be fitted at one scale and served at another.
-        input_std = float(noisy.std())
-        if input_std > 1e-8:
-            noisy = noisy / input_std
-            print(f"[deepseis] normalized field volume to unit std (was {input_std:.4f})")
-        else:
-            print("[deepseis] warning: field volume has near-zero std — check your input file.")
-
         # Real facies labels (optional — F3 has them, most surveys don't)
         facies = None
         if dcfg.get("facies_label_path"):
@@ -295,28 +279,6 @@ def train_denoiser(cfg: dict, noisy: np.ndarray, fault_preservation_enabled: boo
     return model, history
 
 
-#: How many patches to push through the network at once during inference.
-#: Inference peak memory is dominated by intermediate activations, not weights:
-#: a U-Net skip connection holds an (N, C, 64, 64) tensor alive from the encoder
-#: all the way to the decoder, so cost scales linearly with N. Running a whole
-#: section in one pass allocated 1.29 GB for Parihaka's 558 patches -- enough to
-#: get the hosted app OOM-killed. Batching caps it at a fixed ~75 MB regardless
-#: of section size, at no cost to the result: the network is per-patch, so the
-#: output is identical either way.
-INFERENCE_BATCH = 32
-
-
-@torch.no_grad()
-def _forward_in_batches(model, patches: np.ndarray, device: str,
-                         batch: int = INFERENCE_BATCH) -> np.ndarray:
-    """Run ``model`` over ``patches`` in fixed-size chunks. Returns (N, H, W)."""
-    outs = []
-    for i in range(0, len(patches), batch):
-        chunk = to_tensor(patches[i:i + batch], device)
-        outs.append(model(chunk).detach().cpu().numpy()[:, 0])
-    return np.concatenate(outs, axis=0) if outs else np.empty((0,) + patches.shape[1:], np.float32)
-
-
 @torch.no_grad()
 def run_denoiser_inference(model: DenoiserUNet, noisy: np.ndarray, cfg: dict, device: str) -> np.ndarray:
     """Full-image inference: patchify, run the (un-masked) forward pass, stitch back together."""
@@ -324,7 +286,9 @@ def run_denoiser_inference(model: DenoiserUNet, noisy: np.ndarray, cfg: dict, de
     pcfg = cfg["data"]["patch"]
     h, w = noisy.shape
     patches = patch_mod.extract_patches(noisy, pcfg["size"], pcfg["stride"])
-    out_np = _forward_in_batches(model, patches, device)
+    x = to_tensor(patches, device)
+    out = model(x)                              # (N, 1, H, W)
+    out_np = out.detach().cpu().numpy()[:, 0]    # (N, H, W) -- always, regardless of N
     return patch_mod.stitch_patches(out_np, h, w, pcfg["size"], pcfg["stride"])
 
 
@@ -396,7 +360,9 @@ def run_faultseg_inference(model: FaultSegNet2D, section: np.ndarray, cfg: dict,
     pcfg = cfg["data"]["patch"]
     h, w = section.shape
     patches = patch_mod.extract_patches(section, pcfg["size"], pcfg["stride"])
-    out_np = _forward_in_batches(model, patches, device)
+    x = to_tensor(patches, device)
+    out = model(x)                              # (N, 1, H, W)
+    out_np = out.detach().cpu().numpy()[:, 0]    # (N, H, W)
     return patch_mod.stitch_patches(out_np, h, w, pcfg["size"], pcfg["stride"])
 
 
@@ -515,48 +481,9 @@ def refine_with_diffusion(diffusion: GaussianDiffusion, denoised: np.ndarray, cf
 # Orchestration
 # ---------------------------------------------------------------------------
 
-def apply_dataset(cfg: dict, dataset_key: str) -> dict:
-    """Point the config at one survey from the ``datasets:`` registry.
-
-    Rewrites the three fields that select what gets trained on -- the volume, the
-    facies labels, and the output directory -- so that training a registered
-    survey is ``--dataset <key>`` rather than three manual config edits. Each
-    survey writes to its own ``run_dir``: the denoiser is self-supervised, so a
-    model fitted to one survey's noise is not the model to run on another.
-    """
-    registry = cfg.get("datasets", {})
-    if dataset_key not in registry or dataset_key == "default":
-        known = [k for k in registry if k != "default"]
-        raise SystemExit(f"[deepseis] unknown --dataset '{dataset_key}'. Registered: {known}")
-
-    spec = registry[dataset_key]
-    for field, key in (("field_volume_path", "local_seismic"), ("facies_label_path", "local_labels")):
-        path = Path(spec[key])
-        if not path.exists():
-            raise SystemExit(
-                f"[deepseis] {spec['label']}: {path} not found.\n"
-                f"           Fetch it first:  python data/download_{dataset_key}.py"
-            )
-        cfg["data"][field] = str(path)
-
-    cfg["data"]["use_synthetic"] = False
-    cfg["output"]["run_dir"] = spec.get("run_dir", cfg["output"]["run_dir"])
-    cfg["facies"]["n_classes"] = spec.get("n_facies", cfg["facies"]["n_classes"])
-
-    print(f"[deepseis] dataset '{dataset_key}' -> {spec['label']} ({spec['region']})")
-    print(f"[deepseis]   volume  {cfg['data']['field_volume_path']}")
-    print(f"[deepseis]   labels  {cfg['data']['facies_label_path']}")
-    print(f"[deepseis]   run_dir {cfg['output']['run_dir']}")
-    return cfg
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/default.yaml")
-    parser.add_argument("--dataset", type=str, default=None,
-                         help="train on a survey from the config's `datasets:` registry "
-                              "(e.g. f3, parihaka). Sets the volume, labels and run_dir "
-                              "for you; without it the `data:` block is used as written.")
     parser.add_argument("--skip-stretch", action="store_true", help="skip diffusion + facies (faster run)")
     parser.add_argument("--resume", action="store_true",
                          help="resume denoiser training from the last periodic checkpoint, if present "
@@ -564,8 +491,6 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    if args.dataset:
-        cfg = apply_dataset(cfg, args.dataset)
     device = get_device(cfg)
     set_seed(cfg["seed"])
 
@@ -578,7 +503,7 @@ def main() -> None:
     syn_clean = data["syn_clean"]
     syn_fault_mask = data["syn_fault_mask"]
 
-    results: dict = {"config_path": str(args.config), "dataset": args.dataset or "(config as written)"}
+    results: dict = {"config_path": str(args.config)}
 
     # ---- Stage 1: denoiser, trained twice (fault-preservation ON vs OFF) ----
     print("\n=== Training denoiser: fault-preservation OFF ===")
@@ -642,15 +567,15 @@ def main() -> None:
         print(json.dumps(results["fault_metrics"], indent=2))
     else:
         print("\n[metrics] real data mode — no fault GT, skipping Dice/precision/recall (expected).")
-        print(f"          Fault-probability overlays saved to {run_dir}/fault_prob_*.npy for visual QC.")
+        print("          Fault-probability overlays saved to runs/default/fault_prob_*.npy for visual QC.")
 
     # ---- Stretch: facies + diffusion ----
     if not args.skip_stretch and facies is not None and cfg["facies"]["enabled"]:
-        # Real published facies labels — retrain the facies head on them.
+        # Real F3 facies labels — retrain the facies head on them.
         # facies is already the 2D slice matching the noisy section (from prepare_data).
-        print("\n=== Training facies head on real facies labels (stretch) ===")
+        print("\n=== Training facies head on real F3 labels (stretch) ===")
         n_classes_actual = int(facies.max()) + 1
-        print(f"[facies] using {n_classes_actual} classes detected from the labels (0..{n_classes_actual-1})")
+        print(f"[facies] using {n_classes_actual} classes detected from F3 labels (0..{n_classes_actual-1})")
         facies_input = denoised_on if clean is None else clean
         facies_model = train_facies(cfg, facies_input, facies, device)
         torch.save(facies_model.state_dict(), run_dir / "facies.pt")
