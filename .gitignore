@@ -8,3 +8,6 @@ __pycache__/
 
 # Downloaded raw data (too large for git — run python data/download_f3.py)
 data/raw/
+
+# Scratch output from browser-automation QA passes (screenshots + tab dumps)
+.codex_*

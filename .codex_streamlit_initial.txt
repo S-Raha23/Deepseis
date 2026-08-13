@@ -1,5 +1,0 @@
-{
-  "title": "DeepSeis · Streamlit",
-  "url": "https://deepseis-3qkjgkvqrwgvghnjxpm4mb.streamlit.app/",
-  "text": ""
-}
