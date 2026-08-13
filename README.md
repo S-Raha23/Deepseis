@@ -105,6 +105,27 @@ in the sidebar loads that survey's checkpoints automatically. If a survey has no
 yet, the dashboard says so and offers the command rather than silently starting a
 tens-of-minutes CPU training run inside a page load.
 
+### Facies results, and what they do and don't mean
+
+| | F3 Netherlands | Parihaka |
+|---|---|---|
+| Pixel accuracy on the **training** inline | 83.5% | 78.9% |
+| Mean IoU | 55.4% | 49.6% |
+| Best class | Upper North Sea, 90.6% IoU | Basement/Other, 90.3% IoU |
+| Failing class | Triassic — never predicted (2.3% of section) | Slope Valley — predicted over 11.4%, true 0% |
+
+**The headline accuracies are goodness of fit, not generalization.** `prepare_data` fits the
+facies head on inline 0 alone, and the dashboard scores it on that same inline. Measured on
+held-out inlines of Parihaka (40, 98, 150, 195), accuracy falls to **41.9–50.1%** — above
+chance for six classes, but not a validated classifier.
+
+Both failures are class imbalance from single-inline training, in opposite directions. F3's
+Triassic occupies 2.3% of inline 0 and the head never predicts it at all. Parihaka's Slope
+Valley has essentially zero pixels in inline 0, so its output unit is never trained and wins
+in ambiguous regions — visible as a large false region in the upper section. Training the
+facies head across multiple inlines is the fix for both; the tab states this caveat inline so
+the number is never read as more than it is.
+
 **Facies classes**
 `F3` — 0 Upper North Sea · 1 Middle North Sea · 2 Lower North Sea · 3 Rijnland/Chalk · 4 Jurassic · 5 Triassic
 `Parihaka` — 0 Basement/Other · 1 Slope Mudstone A · 2 Mass Transport Deposit · 3 Slope Mudstone B · 4 Slope Valley · 5 Submarine Canyon System
@@ -119,7 +140,7 @@ FaultSeg trains on a freshly generated synthetic volume and is applied to the re
 
 ---
 
-## Dashboard — 5 tabs
+## Dashboard — 6 tabs
 
 Every tab operates on whichever survey is selected in the sidebar.
 
@@ -128,6 +149,7 @@ Every tab operates on whichever survey is selected in the sidebar.
 | 🧮 **Denoise** | Noisy → denoised, fault-preservation ON/OFF toggle side-by-side |
 | 🧩 **Fault segmentation** | Fault-probability overlays on noisy vs. denoised input |
 | 🗺️ **Survey explorer** | Inline slider — scrub through the selected survey's inlines live |
+| 🌊 **Facies** | Predicted vs. ground-truth facies on the denoised inline, with per-class IoU |
 | 📤 **Export** | Download the denoised section as SEG-Y or .npy |
 | 🔬 **Diagnostics** | F-K spectrum, signal-leakage map, Jacobian mask explainer |
 
@@ -143,7 +165,7 @@ Every tab operates on whichever survey is selected in the sidebar.
 - [x] FaultSeg-style fault segmentation — synthetic-trained, applied to real denoised data
 - [x] 6-class facies segmentation — trained on real facies labels
 - [x] SEG-Y export with in-dashboard download button
-- [x] 5-tab Streamlit dashboard, inline slider across the selected survey
+- [x] 6-tab Streamlit dashboard, inline slider across the selected survey
 
 ### Stretch goals
 - [x] Structured N2V for coherent noise with automatic noise-type estimator
@@ -171,7 +193,7 @@ deepseis/
 │   ├── losses/                   # reconstruction.py · edge_preserve.py · frequency.py
 │   ├── interpretation/           # horizon.py
 │   └── train.py · infer.py · metrics.py
-├── app/dashboard.py              # Streamlit 5-tab dashboard
+├── app/dashboard.py              # Streamlit 6-tab dashboard
 ├── Dockerfile                    # builds and launches the full pipeline in one command
 └── tests/                        # pytest test suite
 ```

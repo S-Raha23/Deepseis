@@ -624,15 +624,15 @@ def main() -> None:
         print(json.dumps(results["fault_metrics"], indent=2))
     else:
         print("\n[metrics] real data mode — no fault GT, skipping Dice/precision/recall (expected).")
-        print("          Fault-probability overlays saved to runs/default/fault_prob_*.npy for visual QC.")
+        print(f"          Fault-probability overlays saved to {run_dir}/fault_prob_*.npy for visual QC.")
 
     # ---- Stretch: facies + diffusion ----
     if not args.skip_stretch and facies is not None and cfg["facies"]["enabled"]:
-        # Real F3 facies labels — retrain the facies head on them.
+        # Real published facies labels — retrain the facies head on them.
         # facies is already the 2D slice matching the noisy section (from prepare_data).
-        print("\n=== Training facies head on real F3 labels (stretch) ===")
+        print("\n=== Training facies head on real facies labels (stretch) ===")
         n_classes_actual = int(facies.max()) + 1
-        print(f"[facies] using {n_classes_actual} classes detected from F3 labels (0..{n_classes_actual-1})")
+        print(f"[facies] using {n_classes_actual} classes detected from the labels (0..{n_classes_actual-1})")
         facies_input = denoised_on if clean is None else clean
         facies_model = train_facies(cfg, facies_input, facies, device)
         torch.save(facies_model.state_dict(), run_dir / "facies.pt")

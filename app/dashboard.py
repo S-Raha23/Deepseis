@@ -108,12 +108,16 @@ def get_survey(config_path: str, n_inlines: int):
     return synth_mod.generate_synthetic_survey(n_inlines=n_inlines, random_seed=7)
 
 
-@st.cache_data(show_spinner=False)
+# max_entries=1 so switching surveys evicts the previous volume rather than
+# holding both -- these are hundreds of MB each and Streamlit Cloud is memory-capped.
+@st.cache_data(show_spinner=False, max_entries=1)
 def load_full_volume(config_path: str, dataset_key: str) -> np.ndarray:
     seismic_path, _, _ = resolve_dataset(config_path, dataset_key)
-    vol = segy_mod.load_volume(seismic_path)
-    std = vol.std()
-    return (vol / (std + 1e-8)).astype("float32")
+    # Cast to float32 BEFORE dividing. F3 ships as float64 (573 MB), so dividing
+    # first would allocate a second float64 array and only then narrow it --
+    # a ~1.4 GB peak instead of ~860 MB, on a host with a hard memory cap.
+    vol = segy_mod.load_volume(seismic_path).astype("float32")
+    return vol / (float(vol.std()) + 1e-8)
 
 
 def checkpoints_exist(run_dir: Path, cfg: dict) -> bool:
@@ -122,7 +126,7 @@ def checkpoints_exist(run_dir: Path, cfg: dict) -> bool:
 
 
 @st.cache_resource(show_spinner=False)
-def load_models(config_path: str, run_dir_str: str):
+def load_models(config_path: str, run_dir_str: str, n_classes: int = 6):
     cfg = load_cfg(config_path)
     run_dir = Path(run_dir_str)
     device = get_device(cfg)
@@ -147,7 +151,9 @@ def load_models(config_path: str, run_dir_str: str):
     facies_path = run_dir / "facies.pt"
     if facies_path.exists():
         try:
-            n_classes = cfg["facies"].get("n_classes", 6)
+            # n_classes comes from the survey being loaded, not the global default:
+            # train_facies sizes the head from the labels it saw, so a survey with a
+            # different class count would otherwise fail the shape check below.
             facies_model = FaciesNet2D(in_channels=1, n_classes=n_classes,
                                         base_channels=cfg["faultseg"]["base_channels"],
                                         depth=cfg["faultseg"]["depth"]).to(device)
@@ -156,7 +162,7 @@ def load_models(config_path: str, run_dir_str: str):
         except Exception:
             facies_model = None  # checkpoint mismatch — will show retrain prompt in tab
 
-    return model_on, model_off, faultseg, device
+    return model_on, model_off, faultseg, facies_model, device
 
 
 @torch.no_grad()
@@ -312,9 +318,9 @@ st.sidebar.caption(
 # STARTUP LOADING SCREEN — runs once, shows progress, then renders the dashboard
 # ---------------------------------------------------------------------------
 
-tab_denoise, tab_fault, tab_survey, tab_export, tab_diag = st.tabs([
+tab_denoise, tab_fault, tab_survey, tab_facies, tab_export, tab_diag = st.tabs([
     "🧮 Denoise", "🧩 Fault segmentation", "🗺️ Survey explorer",
-    "📤 Export", "🔬 Diagnostics",
+    "🌊 Facies", "📤 Export", "🔬 Diagnostics",
 ])
 
 # ── Step 1: load data ───────────────────────────────────────────────────────
@@ -375,7 +381,8 @@ startup_status.empty()
 
 # ── Step 2: load models ─────────────────────────────────────────────────────
 load_prog = st.progress(33, text="⚙️ Step 2 / 3 — Loading pre-trained model checkpoints...")
-model_on, model_off, faultseg, device = load_models(config_path, str(run_dir))
+model_on, model_off, faultseg, facies_model, device = load_models(
+    config_path, str(run_dir), ds.get("n_facies", cfg["facies"].get("n_classes", 6)))
 load_prog.progress(66, text="🧠 Step 3 / 3 — Running denoiser inference on seismic section...")
 
 # ── Step 3: run inference ───────────────────────────────────────────────────
@@ -571,7 +578,94 @@ with tab_survey:
 
 
 # ---------------------------------------------------------------------------
-# Tab 4: Export
+# Tab 4: Facies
+# ---------------------------------------------------------------------------
+
+with tab_facies:
+    n_facies = ds.get("n_facies", cfg["facies"].get("n_classes", 6))
+    class_names = ds.get("facies_names", [f"Class {i}" for i in range(n_facies)])
+    st.subheader(f"Facies segmentation — {DATASET_LABEL} lithostratigraphic labels "
+                 f"({n_facies} classes)")
+
+    if facies_model is None:
+        st.warning(
+            f"**No facies checkpoint for {DATASET_LABEL}** (looked for `{run_dir / 'facies.pt'}`).\n\n"
+            f"Train it with:\n\n"
+            f"```\npython -m deepseis.train --config {config_path} --dataset {dataset_key}\n```"
+        )
+    else:
+        with st.spinner("Running facies inference on the denoised section..."):
+            facies_map = run_facies_inference(facies_model, denoised_on, cfg, device)
+
+        # Ground truth is available for both registered surveys, so show the
+        # prediction against it rather than alone -- a facies map on its own
+        # looks plausible even when it is wrong.
+        has_gt = facies_labels is not None and facies_labels.shape == facies_map.shape
+        cols = st.columns(3 if has_gt else 2)
+        with cols[0]:
+            st.plotly_chart(seismic_heatmap(denoised_on, "Denoised seismic (inline 0)"),
+                            use_container_width=True, key="facies_seismic")
+        with cols[1]:
+            st.plotly_chart(facies_heatmap(facies_map, "Predicted facies", n_facies),
+                            use_container_width=True, key="facies_map")
+        if has_gt:
+            with cols[2]:
+                st.plotly_chart(facies_heatmap(facies_labels, "Ground-truth facies", n_facies),
+                                use_container_width=True, key="facies_gt")
+
+        if has_gt:
+            accuracy = float((facies_map == facies_labels).mean())
+            # Mean per-class IoU, computed only over classes actually present in
+            # this inline -- averaging in absent classes as zeros would understate
+            # the result for a section that simply does not intersect them.
+            ious = []
+            for c in range(n_facies):
+                pred_c, gt_c = facies_map == c, facies_labels == c
+                union = np.logical_or(pred_c, gt_c).sum()
+                if union > 0:
+                    ious.append(np.logical_and(pred_c, gt_c).sum() / union)
+            m1, m2 = st.columns(2)
+            m1.metric("Pixel accuracy (fit)", f"{accuracy * 100:.1f}%",
+                       help="Measured on inline 0 — the same section the head was trained on. "
+                            "This is goodness of fit, not generalization.")
+            m2.metric("Mean IoU (fit)", f"{np.mean(ious) * 100:.1f}%" if ious else "—",
+                       help="Averaged over the classes present in this inline.")
+            st.warning(
+                "**These are training-set scores.** The facies head is fitted on inline 0 only "
+                "(`train.prepare_data` takes a single section), and this tab scores it on that "
+                "same inline. Measured on held-out inlines of Parihaka, accuracy falls from ~79% "
+                "to ~42–50%. Treat the map as a qualitative interpretation aid, not a validated "
+                "classifier — training across multiple inlines would be needed for the latter."
+            )
+
+        rows = []
+        for c in range(n_facies):
+            name = class_names[c] if c < len(class_names) else f"Class {c}"
+            pred_px = int((facies_map == c).sum())
+            row = {"Class": f"{c} — {name}",
+                   "Predicted (%)": f"{100 * pred_px / facies_map.size:.1f}"}
+            if has_gt:
+                gt_px = int((facies_labels == c).sum())
+                row["Actual (%)"] = f"{100 * gt_px / facies_labels.size:.1f}"
+                inter = int(np.logical_and(facies_map == c, facies_labels == c).sum())
+                union = int(np.logical_or(facies_map == c, facies_labels == c).sum())
+                row["IoU (%)"] = f"{100 * inter / union:.1f}" if union else "—"
+            rows.append(row)
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        st.caption(f"**{DATASET_LABEL} class legend:** "
+                   + " · ".join(f"{i} = {n}" for i, n in enumerate(class_names)))
+        if has_gt:
+            st.info(
+                f"The facies head is trained on this survey's own published labels "
+                f"({ds['citation']}), then applied to the *denoised* section. Classes absent "
+                f"from inline 0 are shown as 0% — that is the section not intersecting them, "
+                f"not a prediction failure."
+            )
+
+
+# ---------------------------------------------------------------------------
+# Tab 5: Export
 # ---------------------------------------------------------------------------
 
 with tab_export:
