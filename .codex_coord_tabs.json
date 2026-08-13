@@ -1,0 +1,26 @@
+[
+  {
+    "name": "Denoise",
+    "screenshot": "C:/Users/soubh/Downloads/VSCODE/deepseis/.codex_coord_denoise.png"
+  },
+  {
+    "name": "Fault segmentation",
+    "screenshot": "C:/Users/soubh/Downloads/VSCODE/deepseis/.codex_coord_fault_segmentation.png"
+  },
+  {
+    "name": "F3 Survey explorer",
+    "screenshot": "C:/Users/soubh/Downloads/VSCODE/deepseis/.codex_coord_f3_survey_explorer.png"
+  },
+  {
+    "name": "Facies",
+    "screenshot": "C:/Users/soubh/Downloads/VSCODE/deepseis/.codex_coord_facies.png"
+  },
+  {
+    "name": "Export",
+    "screenshot": "C:/Users/soubh/Downloads/VSCODE/deepseis/.codex_coord_export.png"
+  },
+  {
+    "name": "Diagnostics",
+    "screenshot": "C:/Users/soubh/Downloads/VSCODE/deepseis/.codex_coord_diagnostics.png"
+  }
+]

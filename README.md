@@ -45,6 +45,14 @@ FaultSeg trains on a freshly generated synthetic volume and is applied to the re
 **F3 facies classes (Alaudah et al. 2019):**  
 `0` Upper North Sea · `1` Middle North Sea · `2` Lower North Sea · `3` Rijnland/Chalk · `4` Jurassic · `5` Triassic
 
+The facies head is fitted on F3's real labels with `python -m deepseis.fit_facies`, which
+trains only that head and leaves the denoiser and FaultSeg checkpoints alone. It reaches
+**90.4% pixel accuracy** on inline 0 — but that is the inline it was fitted on, so read it
+as goodness of fit, not generalization. Per-class IoU ranges from 96.5% (Upper North Sea)
+down to 0% for Triassic, which occupies 2.3% of the section and is never predicted; the
+Facies tab shows the per-class breakdown and an error map so this is visible rather than
+hidden behind one number.
+
 > To use synthetic data instead, set `data.use_synthetic: true` in `configs/default.yaml`. This enables exact PSNR/SSIM/Dice scoring against a known-clean reference.
 
 ---
@@ -56,7 +64,7 @@ FaultSeg trains on a freshly generated synthetic volume and is applied to the re
 | 🧮 **Denoise** | F3 noisy → denoised, fault-preservation ON/OFF toggle side-by-side |
 | 🧩 **Fault segmentation** | Fault-probability overlays on noisy vs. denoised F3 input |
 | 🗺️ **F3 Survey explorer** | Inline slider — scrub through all 401 real F3 inlines live |
-| 🌊 **Facies** | Predicted 6-class lithostratigraphic map on the denoised inline |
+| 🌊 **Facies** | Predicted 6-class map vs. the published labels, error map, per-class IoU |
 | 📤 **Export** | Download denoised section as SEG-Y or .npy |
 | 🔬 **Diagnostics** | F-K spectrum, signal-leakage map, Jacobian mask explainer |
 

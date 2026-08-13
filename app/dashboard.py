@@ -127,16 +127,21 @@ def load_models(config_path: str, run_dir_str: str):
     facies_path = run_dir / "facies.pt"
     if facies_path.exists():
         try:
-            n_classes = cfg["facies"].get("n_classes", 6)
+            # Size the head from the checkpoint itself rather than the config: a
+            # facies head fitted on synthetic data has 3 outputs while real F3 has
+            # 6, and guessing wrong fails the shape check and silently disables
+            # the tab. The checkpoint is the authority on how many classes it knows.
+            state = torch.load(facies_path, map_location=device)
+            n_classes = int(state["out_conv.bias"].shape[0])
             facies_model = FaciesNet2D(in_channels=1, n_classes=n_classes,
                                         base_channels=cfg["faultseg"]["base_channels"],
                                         depth=cfg["faultseg"]["depth"]).to(device)
-            facies_model.load_state_dict(torch.load(facies_path, map_location=device), strict=False)
+            facies_model.load_state_dict(state)
             facies_model.eval()
         except Exception:
-            facies_model = None  # checkpoint mismatch — will show retrain prompt in tab
+            facies_model = None  # unreadable checkpoint — tab shows how to fit one
 
-    return model_on, model_off, faultseg, device
+    return model_on, model_off, faultseg, facies_model, device
 
 
 @torch.no_grad()
@@ -152,13 +157,22 @@ def run_facies_inference(model: FaciesNet2D, section: np.ndarray, cfg: dict, dev
     logits = model(x)
     preds = logits.argmax(dim=1).detach().cpu().numpy()
     coords = patch_coords(h, w, pcfg["size"], pcfg["stride"])
-    out = np.zeros((h, w), dtype=np.int32)
-    count = np.zeros((h, w), dtype=np.int32)
+    size = pcfg["size"]
+    n_cls = int(logits.shape[1])
+
+    # Majority vote per pixel across the overlapping patches.
+    #
+    # The previous implementation summed the predicted class *indices* and took
+    # the floor of their mean. Averaging categorical labels is not a valid
+    # combination rule: where one patch predicts Lower North Sea (2) and another
+    # Jurassic (4), the mean is 3 -- Rijnland/Chalk, which neither patch
+    # predicted. Because F3's units are stacked in stratigraphic order, that
+    # invented a spurious Rijnland/Chalk band along every 2-to-4 boundary.
+    votes = np.zeros((n_cls, h, w), dtype=np.int16)
     for (y, x0), patch in zip(coords, preds):
-        out[y:y + pcfg["size"], x0:x0 + pcfg["size"]] += patch
-        count[y:y + pcfg["size"], x0:x0 + pcfg["size"]] += 1
-    count[count == 0] = 1
-    return (out // count).astype(np.int32)
+        ys, xs = np.mgrid[y:y + size, x0:x0 + size]
+        np.add.at(votes, (patch, ys, xs), 1)
+    return votes.argmax(axis=0).astype(np.int32)
 
 
 def run_training(config_path: str, run_dir: Path) -> None:
@@ -258,9 +272,9 @@ st.sidebar.caption(
 # STARTUP LOADING SCREEN — runs once, shows progress, then renders the dashboard
 # ---------------------------------------------------------------------------
 
-tab_denoise, tab_fault, tab_survey, tab_export, tab_diag = st.tabs([
+tab_denoise, tab_fault, tab_survey, tab_facies, tab_export, tab_diag = st.tabs([
     "🧮 Denoise", "🧩 Fault segmentation", "🗺️ F3 Survey explorer",
-    "📤 Export", "🔬 Diagnostics",
+    "🌊 Facies", "📤 Export", "🔬 Diagnostics",
 ])
 
 # ── Step 1: load data ───────────────────────────────────────────────────────
@@ -299,7 +313,7 @@ startup_status.empty()
 
 # ── Step 2: load models ─────────────────────────────────────────────────────
 load_prog = st.progress(33, text="⚙️ Step 2 / 3 — Loading pre-trained model checkpoints...")
-model_on, model_off, faultseg, device = load_models(config_path, str(run_dir))
+model_on, model_off, faultseg, facies_model, device = load_models(config_path, str(run_dir))
 load_prog.progress(66, text="🧠 Step 3 / 3 — Running denoiser inference on seismic section...")
 
 # ── Step 3: run inference ───────────────────────────────────────────────────
@@ -493,7 +507,98 @@ with tab_survey:
 
 
 # ---------------------------------------------------------------------------
-# Tab 4: Export
+# Tab 4: Facies
+# ---------------------------------------------------------------------------
+
+F3_FACIES_NAMES = ["Upper North Sea", "Middle North Sea", "Lower North Sea",
+                   "Rijnland/Chalk", "Jurassic", "Triassic"]
+
+with tab_facies:
+    st.subheader("Facies segmentation — F3 lithostratigraphic interpretation")
+
+    if facies_model is None:
+        st.warning(
+            "**No facies checkpoint found** (`runs/default/facies.pt`).\n\n"
+            "Fit one on F3's real 6-class labels — about a minute, and it leaves the "
+            "denoiser and FaultSeg checkpoints untouched:\n\n"
+            "```\npython -m deepseis.fit_facies\n```"
+        )
+    elif facies_labels is None:
+        st.warning("No facies labels available for this section.")
+    else:
+        n_cls = int(max(facies_labels.max(), 0)) + 1
+        names = F3_FACIES_NAMES[:n_cls]
+        with st.spinner("Classifying facies on the denoised section..."):
+            facies_pred = run_facies_inference(facies_model, denoised_on, cfg, device)
+
+        agree = facies_pred == facies_labels
+        accuracy = float(agree.mean())
+        ious = []
+        for c in range(n_cls):
+            pc, gc = facies_pred == c, facies_labels == c
+            union = int(np.logical_or(pc, gc).sum())
+            if union:
+                ious.append(int(np.logical_and(pc, gc).sum()) / union)
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Pixel accuracy", f"{accuracy * 100:.1f}%",
+                   help="Measured on inline 0 — the section the head was fitted on. "
+                        "Goodness of fit, not generalization.")
+        m2.metric("Mean IoU", f"{np.mean(ious) * 100:.1f}%" if ious else "—",
+                   help="Averaged over classes present in this section.")
+        m3.metric("Classes resolved", f"{int((facies_pred[..., None] == np.arange(n_cls)).any((0, 1)).sum())} / {n_cls}",
+                   help="How many of the six F3 units the model actually predicts anywhere.")
+
+        cols = st.columns(3)
+        with cols[0]:
+            st.plotly_chart(seismic_heatmap(denoised_on, "Denoised seismic (inline 0)"),
+                            use_container_width=True, key="facies_seis")
+        with cols[1]:
+            st.plotly_chart(facies_heatmap(facies_pred, "Predicted facies", n_cls),
+                            use_container_width=True, key="facies_pred")
+        with cols[2]:
+            st.plotly_chart(facies_heatmap(facies_labels, "Ground truth (Alaudah et al. 2019)", n_cls),
+                            use_container_width=True, key="facies_gt")
+
+        # Where it is wrong is more useful than the headline score -- a facies map
+        # looks geologically plausible even where it disagrees with the labels.
+        st.markdown("##### Where the model disagrees with the interpretation")
+        err = go.Figure(data=go.Heatmap(
+            z=(~agree).astype(np.int8), colorscale=[[0, "#e8eef2"], [1, "#c0392b"]],
+            showscale=False, hovertemplate="misclassified: %{z}<extra></extra>"))
+        err.update_yaxes(autorange="reversed", title="Sample (depth)")
+        err.update_xaxes(title="Trace")
+        err.update_layout(title=f"Misclassified pixels — {100 * (1 - accuracy):.1f}% of the section",
+                          height=320, margin=dict(l=10, r=10, t=40, b=10))
+        st.plotly_chart(err, use_container_width=True, key="facies_err")
+        st.caption("Errors concentrate at unit boundaries, where a patch-based classifier "
+                   "has to commit to one label for a window spanning two units.")
+
+        rows = []
+        for c in range(n_cls):
+            pc, gc = facies_pred == c, facies_labels == c
+            union = int(np.logical_or(pc, gc).sum())
+            inter = int(np.logical_and(pc, gc).sum())
+            rows.append({
+                "Class": f"{c} — {names[c] if c < len(names) else f'Class {c}'}",
+                "Predicted (%)": f"{100 * pc.mean():.1f}",
+                "Actual (%)": f"{100 * gc.mean():.1f}",
+                "IoU (%)": f"{100 * inter / union:.1f}" if union else "—",
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        st.info(
+            "**Read the accuracy as fit, not skill.** The facies head is fitted on inline 0 "
+            "(`train.prepare_data` takes a single section) and scored here on that same "
+            "inline. Treat the map as an interpretation aid; fitting across multiple inlines "
+            "would be needed for a validated classifier.\n\n"
+            "The head runs on the *denoised* section, so it inherits whatever the denoiser "
+            "preserved or removed — one reason the fault-preservation loss matters."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tab 5: Export
 # ---------------------------------------------------------------------------
 
 with tab_export:
