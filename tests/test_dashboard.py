@@ -252,5 +252,33 @@ def test_3d_tab_states_that_the_time_slice_is_not_denoised(app):
     """A time slice has a different geometry from anything the denoiser was
     trained on. Showing it silently alongside denoised planes would imply it
     had been denoised too."""
-    warnings = " ".join(str(w.value) for w in app.get("warning"))
-    assert "time slice is raw data" in warnings.lower() or "raw data, and deliberately so" in warnings
+    warnings = " ".join(str(w.value) for w in app.get("warning")).lower()
+    assert "raw time slices" in warnings or "time slice is raw" in warnings, \
+        f"the tab does not say the time slice is undenoised: {warnings[:200]}"
+
+
+@needs_data
+def test_3d_tab_offers_cuboid_and_chair_modes_with_separation(app):
+    """The block display and the pull-apart are the point of this tab."""
+    source = APP.read_text(encoding="utf-8")
+    for token, why in [
+        ("viz3d.shell_offsets", "the cuboid shell is not assembled"),
+        ("viz3d.apply_notch", "the chair cut is missing"),
+        ("viz3d.offset_plane", "separation does not move the faces"),
+    ]:
+        assert token in source, why
+
+    radios = [str(r.label) for r in app.get("radio")]
+    assert any("Display" in r for r in radios), "no display-mode selector"
+    sliders = [str(s.label) for s in app.get("slider")]
+    assert any("Separation" in s for s in sliders), "no separation slider"
+
+
+@needs_data
+def test_separation_is_a_translation_not_a_recompute(app):
+    """Moving the separation slider must not trigger denoising again -- the
+    shell is fixed at the survey edges and cached, so only geometry changes."""
+    source = APP.read_text(encoding="utf-8")
+    sep_block = source[source.index('key="d3_sep"'):source.index("st.plotly_chart(fig3d")]
+    assert "offset_plane" in sep_block
+    assert "denoised_inline(separation" not in sep_block

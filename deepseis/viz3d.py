@@ -158,3 +158,61 @@ def scene_aspect(n_crosslines: int, n_inlines: int, n_samples: int,
         "y": n_inlines / longest,
         "z": max(n_samples / longest, 0.05) * vertical_exaggeration,
     }
+
+
+# ---------------------------------------------------------------------------
+# Cuboid assembly
+# ---------------------------------------------------------------------------
+
+def offset_plane(plane: Plane, dx: float = 0.0, dy: float = 0.0, dz: float = 0.0) -> Plane:
+    """Translate a plane without touching its amplitudes.
+
+    This is what makes an exploded view free: pulling the shell of the cuboid
+    apart is a change of position, not of data, so no section has to be
+    denoised again when the separation slider moves.
+    """
+    return Plane(x=plane.x + dx, y=plane.y + dy, z=plane.z + dz, color=plane.color)
+
+
+def apply_notch(plane: Plane, row_from: float = 0.5, col_from: float = 0.5) -> Plane:
+    """Blank out one corner of a face, so the interior can be seen through it.
+
+    This is the "chair" display every interpretation package offers: a solid
+    block with a corner removed, which shows interior slices against the outer
+    faces instead of making the viewer choose between the two.
+
+    The hole is made by writing NaN into ``z`` rather than into ``color``.
+    Plotly omits a surface cell whose vertex is NaN, whereas a NaN colour is
+    merely an undefined colour on a cell that still gets drawn -- the
+    difference between a hole and a grey patch.
+    """
+    n_rows, n_cols = plane.color.shape
+    rows = np.arange(n_rows)[:, None] >= row_from * n_rows
+    cols = np.arange(n_cols)[None, :] >= col_from * n_cols
+    cut = rows & cols
+
+    z = plane.z.astype(np.float32).copy()
+    color = plane.color.astype(np.float32).copy()
+    z[cut] = np.nan
+    color[cut] = np.nan
+    return Plane(x=plane.x, y=plane.y, z=z, color=color)
+
+
+def shell_offsets(separation: float, n_crosslines: int, n_inlines: int,
+                  n_samples: int, reach: float = 0.55) -> dict:
+    """How far each face of the shell slides out, for a given separation.
+
+    ``separation`` runs 0 (closed cuboid) to 1 (fully exploded). Each face
+    moves along its own outward normal and scaled by that axis's own extent,
+    so the block opens evenly instead of one face flying off while another
+    barely moves.
+    """
+    s = float(np.clip(separation, 0.0, 1.0)) * reach
+    return {
+        "inline_near": (0.0, -s * n_inlines, 0.0),
+        "inline_far": (0.0, +s * n_inlines, 0.0),
+        "crossline_near": (-s * n_crosslines, 0.0, 0.0),
+        "crossline_far": (+s * n_crosslines, 0.0, 0.0),
+        "time_top": (0.0, 0.0, +s * n_samples),
+        "time_base": (0.0, 0.0, -s * n_samples),
+    }

@@ -173,3 +173,90 @@ def test_scene_aspect_exaggerates_the_vertical():
     assert a["y"] == pytest.approx(401 / 701)
     true_scale = 255 / 701
     assert a["z"] > true_scale, "no vertical exaggeration applied"
+
+
+# ---------------------------------------------------------------------------
+# Cuboid assembly
+# ---------------------------------------------------------------------------
+
+def test_offset_moves_position_without_touching_amplitudes():
+    """Separation must be a change of position only -- otherwise pulling the
+    cuboid apart would mean re-denoising every face on each slider move."""
+    from deepseis.viz3d import offset_plane
+
+    sec = ramp_section(20, 30)
+    p = inline_plane(sec, 5, decimate=1)
+    q = offset_plane(p, dx=3.0, dy=-7.0, dz=2.0)
+
+    assert np.array_equal(q.color, p.color), "amplitudes changed under a translation"
+    assert np.allclose(q.x, p.x + 3.0)
+    assert np.allclose(q.y, p.y - 7.0)
+    assert np.allclose(q.z, p.z + 2.0)
+
+
+def test_notch_removes_a_corner_as_a_hole_not_a_grey_patch():
+    """Plotly omits a cell whose vertex is NaN but still draws one whose colour
+    is NaN, so the hole has to be cut in z."""
+    from deepseis.viz3d import apply_notch
+
+    sec = ramp_section(20, 40)
+    p = inline_plane(sec, 0, decimate=1)
+    n = apply_notch(p, row_from=0.5, col_from=0.5)
+
+    assert np.isnan(n.z).any(), "no hole was cut in the geometry"
+    assert np.isnan(n.z).sum() == pytest.approx(0.25 * n.z.size, rel=0.15), \
+        "the notch is not roughly a quarter of the face"
+    # the untouched corner must survive intact
+    assert not np.isnan(n.z[0, 0])
+    assert n.color[0, 0] == p.color[0, 0]
+
+
+def test_notch_does_not_mutate_the_plane_it_was_given():
+    from deepseis.viz3d import apply_notch
+
+    p = inline_plane(ramp_section(16, 16), 0, decimate=1)
+    before = p.z.copy()
+    apply_notch(p, 0.5, 0.5)
+    assert np.array_equal(p.z, before), "apply_notch modified its input in place"
+
+
+def test_closed_cuboid_has_zero_separation():
+    from deepseis.viz3d import shell_offsets
+
+    off = shell_offsets(0.0, 701, 401, 255)
+    for name, (dx, dy, dz) in off.items():
+        assert (dx, dy, dz) == (0.0, 0.0, 0.0), f"{name} moved at separation 0"
+
+
+def test_faces_move_outward_along_their_own_normals():
+    """Each face slides along its own axis, or the block opens lopsidedly."""
+    from deepseis.viz3d import shell_offsets
+
+    off = shell_offsets(1.0, 701, 401, 255)
+    assert off["inline_near"][1] < 0 < off["inline_far"][1], "inline faces do not oppose"
+    assert off["crossline_near"][0] < 0 < off["crossline_far"][0], "crossline faces do not oppose"
+    assert off["time_base"][2] < 0 < off["time_top"][2], "time faces do not oppose"
+    # and each moves only along its own axis
+    assert off["inline_near"][0] == 0 and off["inline_near"][2] == 0
+    assert off["crossline_far"][1] == 0 and off["crossline_far"][2] == 0
+    assert off["time_top"][0] == 0 and off["time_top"][1] == 0
+
+
+def test_separation_scales_each_axis_by_its_own_extent():
+    """A fixed offset in survey units would fling the short axis far and barely
+    move the long one."""
+    from deepseis.viz3d import shell_offsets
+
+    off = shell_offsets(1.0, n_crosslines=700, n_inlines=350, n_samples=250)
+    assert off["crossline_far"][0] == pytest.approx(2 * off["inline_far"][1], rel=1e-6)
+
+
+def test_separation_is_monotone_and_clamped():
+    from deepseis.viz3d import shell_offsets
+
+    a = shell_offsets(0.25, 700, 400, 250)["inline_far"][1]
+    b = shell_offsets(0.75, 700, 400, 250)["inline_far"][1]
+    assert 0 < a < b
+    # out-of-range input must not fling the faces to infinity
+    assert shell_offsets(5.0, 700, 400, 250) == shell_offsets(1.0, 700, 400, 250)
+    assert shell_offsets(-3.0, 700, 400, 250) == shell_offsets(0.0, 700, 400, 250)

@@ -935,54 +935,93 @@ def denoised_crossline(crossline_idx: int, cache_key: tuple = ()):
 
 
 with tab_3d:
-    st.subheader("3D view — denoised sections in survey coordinates")
+    st.subheader("3D view — the survey as a block")
 
     if not is_real_data:
         st.info("The 3D view needs the real F3 survey; switch off `data.use_synthetic`.")
     else:
         vol3d = load_f3_full()
         n_il, n_xl, n_t = vol3d.shape
+        key3d = artifact_key(BLINDSPOT_CHECKPOINT)
 
-        c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+        mode = st.radio(
+            "Display", ["Cuboid", "Chair cut", "Slices through the middle"],
+            horizontal=True, key="d3_mode",
+            help="Cuboid shows the outside of the block. Chair cut removes a corner so "
+                 "you can see interior slices against the outer faces. Slices shows only "
+                 "the interior planes.",
+        )
+
+        c1, c2, c3 = st.columns(3)
         il_idx = c1.slider("Inline", 0, n_il - 1, n_il // 2, key="d3_il")
         xl_idx = c2.slider("Crossline", 0, n_xl - 1, n_xl // 2, key="d3_xl")
         t_idx = c3.slider("Time slice (sample)", 0, n_t - 1, n_t // 2, key="d3_t")
-        detail = c4.select_slider("Detail", options=["Fast", "Balanced", "Full"],
+
+        c4, c5, c6 = st.columns([2, 1, 1])
+        separation = c4.slider(
+            "Separation", 0.0, 1.0, 0.0, 0.05, key="d3_sep",
+            help="Slides the outer faces apart along their own axes to reveal the "
+                 "interior. Costs nothing to change — it moves the planes, it does "
+                 "not recompute them.")
+        detail = c5.select_slider("Detail", options=["Fast", "Balanced", "Full"],
                                   value="Balanced", key="d3_detail",
-                                  help="How finely the planes are sampled before being "
-                                       "sent to the browser. Every point becomes JSON, so "
-                                       "'Full' is heavy on a slow connection.")
-        step = {"Fast": 4, "Balanced": 2, "Full": 1}[detail]
-
-        o1, o2, o3 = st.columns([1, 1, 2])
-        show_denoised = o1.toggle("Denoised", value=True, key="d3_den",
+                                  help="Every mesh point becomes JSON for the browser.")
+        show_denoised = c6.toggle("Denoised", value=True, key="d3_den",
                                   help="Off shows the raw survey, for comparison in place.")
-        show_horizons = o2.toggle("Horizons", value=True, key="d3_hz")
-        show_timeslice = o3.toggle("Show time slice (raw — see note)", value=True, key="d3_ts")
+        step = {"Fast": 4, "Balanced": 2, "Full": 1}[detail]
+        show_horizons = st.toggle("Horizons", value=True, key="d3_hz")
 
-        with st.spinner("Denoising sections and building the scene..."):
-            key = artifact_key(BLINDSPOT_CHECKPOINT)
+        def section_at(kind, index):
             if show_denoised:
-                il_sec = denoised_inline(il_idx, key)
-                xl_sec = denoised_crossline(xl_idx, key)
-            else:
-                il_sec = np.asarray(vol3d[il_idx], dtype=np.float32).T
-                xl_sec = np.asarray(vol3d[:, xl_idx], dtype=np.float32).T
+                return (denoised_inline(index, key3d) if kind == "inline"
+                        else denoised_crossline(index, key3d))
+            if kind == "inline":
+                return np.asarray(vol3d[int(index)], dtype=np.float32).T
+            return np.asarray(vol3d[:, int(index)], dtype=np.float32).T
 
-            planes = [viz3d.inline_plane(il_sec, il_idx, step),
-                      viz3d.crossline_plane(xl_sec, xl_idx, step)]
-            if show_timeslice:
-                planes.append(viz3d.timeslice_plane(
-                    np.asarray(vol3d[:, :, t_idx], dtype=np.float32), t_idx, step + 1))
-
+        with st.spinner("Denoising sections and building the block..."):
+            il_sec = section_at("inline", il_idx)
+            xl_sec = section_at("crossline", xl_idx)
             cmin, cmax = viz3d.symmetric_limits(il_sec, xl_sec)
 
+            traces = []
+            if mode in ("Cuboid", "Chair cut"):
+                # The shell. Its four vertical faces sit at the survey edges, so
+                # they are denoised once and cached for good; only the interior
+                # slices change as the sliders move.
+                offsets = viz3d.shell_offsets(separation, n_xl, n_il, n_t)
+                shell = [
+                    (viz3d.inline_plane(section_at("inline", 0), 0, step), "inline_near"),
+                    (viz3d.inline_plane(section_at("inline", n_il - 1), n_il - 1, step),
+                     "inline_far"),
+                    (viz3d.crossline_plane(section_at("crossline", 0), 0, step),
+                     "crossline_near"),
+                    (viz3d.crossline_plane(section_at("crossline", n_xl - 1), n_xl - 1, step),
+                     "crossline_far"),
+                    (viz3d.timeslice_plane(np.asarray(vol3d[:, :, 0], dtype=np.float32),
+                                           0, step + 1), "time_top"),
+                    (viz3d.timeslice_plane(np.asarray(vol3d[:, :, n_t - 1], dtype=np.float32),
+                                           n_t - 1, step + 1), "time_base"),
+                ]
+                for plane, name in shell:
+                    if mode == "Chair cut":
+                        plane = viz3d.apply_notch(plane, 0.5, 0.5)
+                    traces.append(viz3d.offset_plane(plane, *offsets[name]))
+
+            # Interior slices, so the chair cut and the exploded view have
+            # something to reveal.
+            if mode != "Cuboid" or separation > 0:
+                traces.append(viz3d.inline_plane(il_sec, il_idx, step))
+                traces.append(viz3d.crossline_plane(xl_sec, xl_idx, step))
+                traces.append(viz3d.timeslice_plane(
+                    np.asarray(vol3d[:, :, t_idx], dtype=np.float32), t_idx, step + 1))
+
             fig3d = go.Figure()
-            for plane in planes:
+            for plane in traces:
                 fig3d.add_trace(go.Surface(
                     x=plane.x, y=plane.y, z=plane.z, surfacecolor=plane.color,
                     colorscale=SEISMIC_COLORSCALE, cmin=cmin, cmax=cmax,
-                    showscale=False, opacity=1.0,
+                    showscale=False,
                     lighting=dict(ambient=0.95, diffuse=0.2, specular=0.05),
                     contours=dict(x=dict(highlight=False), y=dict(highlight=False),
                                   z=dict(highlight=False)),
@@ -1001,52 +1040,56 @@ with tab_3d:
                     fig3d.add_trace(go.Scatter3d(
                         x=hx, y=hy, z=hz, mode="lines",
                         line=dict(width=5, color=FACIES_COLORS[k % len(FACIES_COLORS)]),
-                        name=f"Horizon {k + 1}", hoverinfo="name"))
+                        name="Horizon %d" % (k + 1), hoverinfo="name"))
 
             aspect = viz3d.scene_aspect(n_xl, n_il, n_t)
             axis_style = dict(showbackground=True, backgroundcolor="rgb(12,14,20)",
-                              gridcolor="rgba(120,130,150,0.25)", zerolinecolor="rgba(120,130,150,0.4)",
+                              gridcolor="rgba(120,130,150,0.22)",
+                              zerolinecolor="rgba(120,130,150,0.4)",
                               color="rgb(200,205,215)")
             fig3d.update_layout(
-                height=680, margin=dict(l=0, r=0, t=10, b=0),
+                height=700, margin=dict(l=0, r=0, t=10, b=0),
                 paper_bgcolor="rgb(12,14,20)",
                 scene=dict(
                     xaxis=dict(title="Crossline", **axis_style),
                     yaxis=dict(title="Inline", **axis_style),
-                    zaxis=dict(title="Sample (two-way time →)", **axis_style),
+                    zaxis=dict(title="Sample (two-way time \u2192)", **axis_style),
                     aspectmode="manual",
                     aspectratio=dict(x=aspect["x"], y=aspect["y"], z=aspect["z"]),
-                    camera=dict(eye=dict(x=1.6, y=-1.5, z=0.9)),
+                    camera=dict(eye=dict(x=1.7, y=-1.6, z=0.85)),
                 ),
                 showlegend=show_horizons,
                 legend=dict(font=dict(color="rgb(200,205,215)"), bgcolor="rgba(0,0,0,0)"),
             )
-            st.plotly_chart(fig3d, width='stretch', key="d3_scene")
+            st.plotly_chart(fig3d, width="stretch", key="d3_scene")
 
-        st.caption(
-            "Drag to rotate, scroll to zoom. The vertical axis is exaggerated "
-            f"{viz3d.scene_aspect(n_xl, n_il, n_t)['z'] / max(n_t / max(n_xl, n_il), 1e-9):.1f}x — "
-            "a true-scale seismic cube is a thin sheet with no visible structure, so "
-            "interpretation software exaggerates it as a matter of course."
+        hint = {
+            "Cuboid": "The outside of the survey. Raise **Separation** to slide the faces "
+                      "apart and expose the interior slices at your slider positions.",
+            "Chair cut": "A corner of every outer face is removed, so the interior slices "
+                         "read against the outside of the block — the standard chair "
+                         "display.",
+            "Slices through the middle": "Just the three interior planes, intersecting at "
+                                         "your slider positions.",
+        }[mode]
+        st.caption(hint + "  Drag to rotate, scroll to zoom.")
+
+        st.warning(
+            "**The vertical faces are %s; the top and bottom of the block are raw time "
+            "slices, and always will be.** A time slice is an inline x crossline plane at "
+            "fixed two-way time — a different geometry from the time x trace sections "
+            "this denoiser was trained on, so running the model on one returns something "
+            "plausible and meaningless. A genuinely denoised time slice needs every inline "
+            "denoised first, about eight minutes of CPU here, which belongs in a "
+            "precomputed volume rather than a live view."
+            % ("denoised" if show_denoised else "raw")
         )
 
-        if show_timeslice:
-            st.warning(
-                "**The time slice is raw data, and deliberately so.** A time slice is an "
-                "inline × crossline plane at fixed two-way time — a different geometry from "
-                "the time × trace sections this denoiser was trained on. Running the model "
-                "on one would return something that looks plausible and means nothing. "
-                "Producing a genuinely denoised time slice needs every inline denoised "
-                "first, which is about 8 minutes of CPU here, so it belongs in a "
-                "precomputed volume rather than a live view. The two vertical planes are "
-                f"{'denoised' if show_denoised else 'raw'}."
-            )
-
         st.caption(
-            "Horizons are tracked on the displayed inline and drawn where the tracker "
-            "actually followed a reflector — a break in a line is a pick that was lost, "
-            "usually across a fault, not a rendering gap. Faults are used to widen the "
-            "tracker's search window rather than being drawn directly."
+            "Horizons are tracked on the displayed inline; a break in a line is a pick the "
+            "tracker lost, usually across a fault, not a rendering gap. The vertical axis "
+            "is exaggerated, as it is in every interpretation package — a true-scale "
+            "seismic cube is a thin sheet with no visible structure."
         )
 
 
