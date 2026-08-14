@@ -22,28 +22,46 @@ import numpy as np
 
 
 def _blind_region_indices(center: tuple[int, int], shape: tuple[int, int],
-                           blind_shape: str, blind_width: int) -> tuple[np.ndarray, np.ndarray]:
-    """Pixel coordinates of the blind region around one selected center pixel."""
+                           blind_shape: str, blind_width: int,
+                           blind_length: int = 9) -> tuple[np.ndarray, np.ndarray]:
+    """Pixel coordinates of the blind region around one selected center pixel.
+
+    The region is a *bounded* segment ``blind_length`` long, not a stripe
+    spanning the whole patch.
+
+    That distinction is the difference between StructN2V working and
+    destroying the data. The blind region only has to cover the noise's
+    correlation length, which is a handful of samples; extending it across the
+    full extent of the axis blinds far more than the noise correlates over.
+    With the shipped settings -- a 64x64 patch, ``mask_fraction: 0.02``, and a
+    3-wide full-height stripe per centre -- the 82 centres between them
+    replaced **97.9% of every patch** with a random shuffle of its own values.
+    Measured on real F3, ``masking.mode: "auto"`` routed 76% of patches down
+    this path, so three-quarters of training was noise-to-noise regression with
+    almost no input left to predict from, and the only function that minimises
+    that is a smooth low-order guess. It is the direct cause of the previous
+    denoiser behaving as a low-pass filter.
+
+    Broaddus et al. (2020) use a short segment for exactly this reason.
+    """
     cy, cx = center
     h, w = shape
     half = blind_width // 2
+    reach = max(blind_length // 2, 0)
 
-    if blind_shape == "trace":       # vertical stripe -> blinds along the time/depth axis
-        ys = np.arange(0, h)
+    if blind_shape == "trace":       # short vertical segment -> along time/depth
+        ys = np.clip(np.arange(cy - reach, cy + reach + 1), 0, h - 1)
         xs = np.clip(np.arange(cx - half, cx + half + 1), 0, w - 1)
         yy, xx = np.meshgrid(ys, xs, indexing="ij")
-    elif blind_shape == "horizontal":  # horizontal stripe -> blinds along the trace axis
-        xs = np.arange(0, w)
+    elif blind_shape == "horizontal":  # short horizontal segment -> along traces
+        xs = np.clip(np.arange(cx - reach, cx + reach + 1), 0, w - 1)
         ys = np.clip(np.arange(cy - half, cy + half + 1), 0, h - 1)
         yy, xx = np.meshgrid(ys, xs, indexing="ij")
-    elif blind_shape == "diagonal":   # diagonal band -> for dipping linear noise
-        length = max(h, w)
-        offsets = np.arange(-length // 2, length // 2)
+    elif blind_shape == "diagonal":   # short diagonal band -> for dipping linear noise
+        offsets = np.arange(-reach, reach + 1)
         ys = np.clip(cy + offsets, 0, h - 1)
         xs = np.clip(cx + offsets, 0, w - 1)
-        band = []
-        for dw in range(-half, half + 1):
-            band.append((ys, np.clip(xs + dw, 0, w - 1)))
+        band = [(ys, np.clip(xs + dw, 0, w - 1)) for dw in range(-half, half + 1)]
         yy = np.concatenate([b[0] for b in band])
         xx = np.concatenate([b[1] for b in band])
     else:
@@ -53,7 +71,9 @@ def _blind_region_indices(center: tuple[int, int], shape: tuple[int, int],
 
 
 def generate_mask_and_blind_regions(shape: tuple[int, int], mask_fraction: float, blind_shape: str,
-                                     blind_width: int, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
+                                     blind_width: int, rng: np.random.Generator,
+                                     blind_length: int = 9,
+                                     max_blind_fraction: float = 0.35) -> tuple[np.ndarray, np.ndarray]:
     """Returns (center_mask, blind_region_mask).
 
     ``center_mask`` marks the pixels the loss is evaluated at (same role as
@@ -67,10 +87,24 @@ def generate_mask_and_blind_regions(shape: tuple[int, int], mask_fraction: float
 
     center_mask = np.zeros(shape, dtype=bool)
     blind_region_mask = np.zeros(shape, dtype=bool)
+    budget = int(max_blind_fraction * h * w)
+
     for cy, cx in zip(centers_y, centers_x):
+        yy, xx = _blind_region_indices((cy, cx), shape, blind_shape, blind_width, blind_length)
+        # Hard ceiling on how much of the patch may be blinded at once. Each
+        # blind region is small, but they accumulate, and once they cover most
+        # of the patch the network is being asked to reconstruct an image from
+        # a shuffle of itself. That is what the previous configuration did, and
+        # nothing stopped it, so the limit is enforced here rather than left to
+        # whoever picks mask_fraction.
+        # Checked before the region is added, not after, so the ceiling is a
+        # real bound rather than one that can be overshot by a whole region.
+        already = blind_region_mask[yy, xx].sum()
+        if blind_region_mask.sum() + (len(yy) - already) > budget:
+            break
         center_mask[cy, cx] = True
-        yy, xx = _blind_region_indices((cy, cx), shape, blind_shape, blind_width)
         blind_region_mask[yy, xx] = True
+
     return center_mask, blind_region_mask
 
 
@@ -99,7 +133,9 @@ def make_training_pair(patch: np.ndarray, cfg: dict, rng: np.random.Generator) -
     """Return (masked_input, center_mask, target) for one patch, StructN2V-style."""
     s_cfg = cfg["masking"]["struct_n2v"]
     center_mask, blind_region_mask = generate_mask_and_blind_regions(
-        patch.shape, s_cfg["mask_fraction"], s_cfg["blind_shape"], s_cfg["blind_width"], rng
+        patch.shape, s_cfg["mask_fraction"], s_cfg["blind_shape"], s_cfg["blind_width"], rng,
+        blind_length=int(s_cfg.get("blind_length", 9)),
+        max_blind_fraction=float(s_cfg.get("max_blind_fraction", 0.35)),
     )
     masked_input = apply_structured_blind_spot(patch, blind_region_mask, rng)
     return masked_input, center_mask, patch

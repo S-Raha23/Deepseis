@@ -56,7 +56,7 @@ def set_seed(seed: int) -> None:
 def get_device(cfg: dict) -> str:
     want = cfg.get("device", "cpu")
     if want == "cuda" and not torch.cuda.is_available():
-        print("[deepseis] cuda requested but not available -> falling back to cpu")
+        print("[deepseis] cuda requested but not available -> falling back to cpu", flush=True)
         return "cpu"
     return want
 
@@ -105,17 +105,19 @@ def prepare_data(cfg: dict) -> dict:
             # (n_inlines, n_crosslines, n_samples) -> take inline 0 as (n_samples, n_traces)
             noisy = noisy[0].T
         noisy = noisy.astype(np.float32)
-        print(f"[deepseis] loaded field volume from {dcfg['field_volume_path']}, shape={noisy.shape}")
+        print(f"[deepseis] loaded field volume from {dcfg['field_volume_path']}, shape={noisy.shape}", flush=True)
 
-        # Normalize to unit std so training and serving agree. F3 ships pre-scaled
-        # to [-1, 1] (std ~0.23) while the dashboard and infer.py both divide the
-        # section by its own std before calling the model -- without this the
-        # denoiser is fitted at one amplitude scale and served at another, 4.4x
-        # apart. The loss weights and learning rate are tuned for unit scale too.
+        # The *legacy* masking denoiser was fitted on unit-std data and keeps no
+        # record of the scale, so it needs this. The blind-spot model does not:
+        # it carries its own normalisation constants and applies them itself, so
+        # handing it this array would scale it twice. Both forms are returned
+        # and each consumer takes the one it needs -- `raw_noisy` for anything
+        # going through `serve_section`, `noisy` for the legacy path.
+        raw_noisy = noisy.copy()
         input_std = float(noisy.std())
         if input_std > 1e-8:
             noisy = noisy / input_std
-            print(f"[deepseis] normalized field volume to unit std (was {input_std:.4f})")
+            print(f"[deepseis] normalized field volume to unit std (was {input_std:.4f})", flush=True)
 
         # Real facies labels (optional — F3 has them, most surveys don't)
         facies = None
@@ -138,6 +140,7 @@ def prepare_data(cfg: dict) -> dict:
         return {
             "clean": None,
             "noisy": noisy,
+            "raw_noisy": raw_noisy,
             "fault_mask": None,
             "facies": facies,
             # FaultSeg trains on these, separately from the real denoiser data:
@@ -154,6 +157,7 @@ def prepare_data(cfg: dict) -> dict:
     return {
         "clean": vol.clean,
         "noisy": noisy,
+        "raw_noisy": noisy,   # synthetic data is generated at unit-ish scale already
         "fault_mask": vol.fault_mask,
         "facies": vol.facies,
         "syn_clean": vol.clean,
@@ -236,7 +240,7 @@ def train_denoiser(cfg: dict, noisy: np.ndarray, fault_preservation_enabled: boo
         start_epoch = ckpt["epoch"] + 1
         history = ckpt.get("history", [])
         if verbose:
-            print(f"[denoiser] resumed from checkpoint at epoch {start_epoch}")
+            print(f"[denoiser] resumed from checkpoint at epoch {start_epoch}", flush=True)
 
     for epoch in range(start_epoch, tcfg["epochs"]):
         epoch_losses = {"recon": 0.0, "edge": 0.0, "freq": 0.0, "total": 0.0}
@@ -326,11 +330,11 @@ def train_faultseg(cfg: dict, clean: np.ndarray, fault_mask: np.ndarray, device:
     model = FaultSegNet2D(in_channels=1, base_channels=fcfg["base_channels"], depth=fcfg["depth"]).to(device)
 
     if fcfg.get("pretrained_weights_path") and load_pretrained_or_none(model, fcfg["pretrained_weights_path"], device):
-        print("[faultseg] loaded pretrained weights")
+        print("[faultseg] loaded pretrained weights", flush=True)
         return model
 
     if not fcfg.get("train_on_synthetic_if_missing", True):
-        print("[faultseg] no pretrained weights and train_on_synthetic_if_missing=False -> untrained model")
+        print("[faultseg] no pretrained weights and train_on_synthetic_if_missing=False -> untrained model", flush=True)
         return model
 
     pcfg = cfg["data"]["patch"]
@@ -360,7 +364,7 @@ def train_faultseg(cfg: dict, clean: np.ndarray, fault_mask: np.ndarray, device:
             n_batches += 1
 
         if verbose and (epoch % 2 == 0 or epoch == fcfg["epochs"] - 1):
-            print(f"[faultseg] epoch {epoch:02d}  loss={epoch_loss / max(n_batches, 1):.4f}")
+            print(f"[faultseg] epoch {epoch:02d}  loss={epoch_loss / max(n_batches, 1):.4f}", flush=True)
 
     return model
 
@@ -414,7 +418,7 @@ def train_facies(cfg: dict, clean: np.ndarray, facies: np.ndarray, device: str) 
     counts = np.bincount(facies_patches.reshape(-1), minlength=n_classes).astype(np.float64)
     weights = np.where(counts > 0, counts.sum() / (n_classes * np.maximum(counts, 1)), 0.0)
     class_weight = torch.tensor(weights, dtype=torch.float32, device=device)
-    print(f"[facies] class weights: {np.round(weights, 2).tolist()}")
+    print(f"[facies] class weights: {np.round(weights, 2).tolist()}", flush=True)
 
     # Configurable: the facies loss was still falling at the old hardcoded 6,
     # i.e. the head was being stopped while underfit.
@@ -436,7 +440,7 @@ def train_facies(cfg: dict, clean: np.ndarray, facies: np.ndarray, device: str) 
             opt.step()
             epoch_loss += loss.item()
             n_batches += 1
-        print(f"[facies] epoch {epoch:02d}  loss={epoch_loss / max(n_batches, 1):.4f}")
+        print(f"[facies] epoch {epoch:02d}  loss={epoch_loss / max(n_batches, 1):.4f}", flush=True)
 
     return model
 
@@ -445,7 +449,17 @@ def train_facies(cfg: dict, clean: np.ndarray, facies: np.ndarray, device: str) 
 # Stretch: diffusion refiner
 # ---------------------------------------------------------------------------
 
-def train_diffusion(cfg: dict, denoised: np.ndarray, device: str) -> GaussianDiffusion:
+def train_diffusion(cfg: dict, prior_data: np.ndarray, device: str) -> GaussianDiffusion:
+    """Fit the refiner's prior.
+
+    ``prior_data`` is the *field* section, not the denoiser's output. Training
+    it on the denoiser's output -- which is what this used to do -- makes its
+    learned prior a prior over already-smoothed images, so the best a
+    refinement pass can do is re-impose the smoothing it was shown, and the
+    worst is to hallucinate structure that was never in the data. A refiner
+    can only add something if its prior was fitted on something the first
+    stage did not already produce.
+    """
     dcfg = cfg["diffusion"]
     pcfg = cfg["data"]["patch"]
     set_seed(cfg["seed"])
@@ -456,7 +470,7 @@ def train_diffusion(cfg: dict, denoised: np.ndarray, device: str) -> GaussianDif
                                    physics_prior_weight=dcfg["physics_prior_weight"], device=device)
     opt = torch.optim.Adam(unet.parameters(), lr=1e-3)
 
-    patches = patch_mod.extract_patches(denoised, pcfg["size"], pcfg["stride"])
+    patches = patch_mod.extract_patches(prior_data, pcfg["size"], pcfg["stride"])
     for epoch in range(dcfg["epochs"]):
         idx = np.arange(len(patches))
         rng.shuffle(idx)
@@ -472,7 +486,7 @@ def train_diffusion(cfg: dict, denoised: np.ndarray, device: str) -> GaussianDif
             opt.step()
             epoch_loss += loss.item()
             n_batches += 1
-        print(f"[diffusion] epoch {epoch:02d}  loss={epoch_loss / max(n_batches, 1):.4f}")
+        print(f"[diffusion] epoch {epoch:02d}  loss={epoch_loss / max(n_batches, 1):.4f}", flush=True)
 
     return diffusion
 
@@ -506,13 +520,148 @@ def refine_with_diffusion(diffusion: GaussianDiffusion, denoised: np.ndarray, cf
 # Orchestration
 # ---------------------------------------------------------------------------
 
+def resolve_denoiser(cfg: dict, args, device: str, fallback_section: np.ndarray | None = None):
+    """Return ``(denoise_fn, label)`` for whichever denoiser should feed the heads.
+
+    Prefers the blind-spot denoiser. The legacy masking model is only trained
+    when explicitly asked for, because it is superseded on every measured axis
+    and training it twice -- once with the structure loss and once without --
+    used to consume most of this script's runtime producing an ablation of a
+    model nothing downstream uses any more.
+    """
+    ckpt = Path(args.blindspot)
+    if ckpt.exists():
+        from deepseis.denoise import load_denoiser as load_blindspot
+        from deepseis.denoise import serve_section
+
+        model, noise_model, meta = load_blindspot(ckpt, device)
+
+        def denoise(section: np.ndarray) -> np.ndarray:
+            return serve_section(model, noise_model, meta, section, device)
+
+        return denoise, f"blind-spot ({ckpt})"
+
+    print(f"[deepseis] no blind-spot checkpoint at {ckpt}; falling back to the legacy "
+          f"masking denoiser. Train the current one with:\n"
+          f"           python -m deepseis.denoise --config configs/denoise.yaml --field")
+    if fallback_section is None:
+        raise ValueError("no blind-spot checkpoint and no section to fit the legacy model on")
+    model, _ = train_denoiser(cfg, fallback_section, fault_preservation_enabled=True, device=device)
+    return (lambda section: run_denoiser_inference(model, section, cfg, device)), "legacy masking"
+
+
+def facies_split_ranges(labels, cfg: dict) -> dict:
+    """Train / val / test inline ranges confined to where every unit occurs.
+
+    Returns contiguous blocks separated by buffers, all inside the interval in
+    which all classes are present. Scanning for that interval rather than
+    hard-coding it keeps this correct if the label volume changes.
+    """
+    n_inlines = labels.shape[0]
+    n_classes = int(np.asarray(labels[::20]).max()) + 1
+
+    step = max(n_inlines // 80, 1)
+    complete = [i for i in range(0, n_inlines, step)
+                if len(np.unique(np.asarray(labels[i]))) == n_classes]
+    if not complete:
+        # No section has every unit; fall back to the whole survey and let the
+        # scored-class set narrow itself.
+        lo, hi = 0, n_inlines
+    else:
+        lo, hi = min(complete), max(complete) + step
+    hi = min(hi, n_inlines)
+
+    span = hi - lo
+    buffer = int(cfg["facies"].get("split_buffer", 15))
+    usable = span - 2 * buffer
+    if usable < 12:                       # too small to split; keep it simple
+        buffer = max(span // 12, 1)
+        usable = span - 2 * buffer
+
+    n_train = int(usable * 0.62)
+    n_val = int(usable * 0.22)
+    train = (lo, lo + n_train)
+    val = (train[1] + buffer, train[1] + buffer + n_val)
+    test = (val[1] + buffer, hi)
+    return {"train": train, "val": val, "test": test}
+
+
+def train_facies_head(cfg: dict, denoise_fn, run_dir: Path, device: str):
+    """Fit the facies head across the survey and score it on held-out inlines.
+
+    Replaces the single-inline fit whose 94.4% pixel accuracy was measured on
+    the one line it was trained on. Sections are denoised first, so the number
+    reflects the pipeline that will actually serve them.
+    """
+    from deepseis.facies import train_facies_multi
+    from deepseis.io.dataset import SeismicVolume
+
+    dcfg = cfg["data"]
+    if not dcfg.get("facies_label_path") or not Path(dcfg["facies_label_path"]).exists():
+        print("[facies] no label volume — skipping", flush=True)
+        return None
+
+    volume = SeismicVolume(dcfg["field_volume_path"], buffer=30)
+    labels = np.load(dcfg["facies_label_path"], mmap_mode="r")
+
+    n_train = int(cfg["facies"].get("n_train_sections", 24))
+    n_val = int(cfg["facies"].get("n_val_sections", 6))
+
+    # The denoiser's survey-wide split is wrong for this task. F3's facies are
+    # segregated along the inline axis: all six units occur only in inlines
+    # 0-168, Triassic disappearing around 168 and Jurassic thinning to nothing
+    # by ~235. Splitting the whole survey therefore puts validation in a region
+    # where two of the six units do not exist, so they cannot be scored at all
+    # and the held-out number silently covers only four classes.
+    #
+    # The facies split is confined to the interval where every unit is present,
+    # so train and validation see the same stratigraphic column and all six are
+    # scoreable. It is still a spatial hold-out with a buffer -- validation
+    # inlines are far enough from training ones for the 0.93 inter-line
+    # correlation to decay -- just a smaller one.
+    facies_splits = facies_split_ranges(labels, cfg)
+    print(f"[facies] split confined to inlines where all units occur: {facies_splits}", flush=True)
+
+    def gather(split: str, n: int):
+        lo, hi = facies_splits[split]
+        idx = np.arange(lo, hi)
+        chosen = idx[np.linspace(0, len(idx) - 1, min(n, len(idx))).astype(int)]
+        # normalized=False: denoise_fn goes through serve_section, which applies
+        # the checkpoint's own normalisation. Handing it pre-normalised data
+        # divides by the scale twice, and the failure is silent -- the network
+        # is scale equivariant while sigma_n is a fixed physical level, so the
+        # result is quiet under-denoising rather than an obvious blow-up. Fitted
+        # on that, the facies head scored 0.93 against its own broken input and
+        # 0.13 against correctly served data.
+        secs = [denoise_fn(volume.inline(int(i), normalized=False)) for i in chosen]
+        labs = [np.asarray(labels[int(i)]).T.astype(np.int64) for i in chosen]
+        return secs, labs, chosen
+
+    print(f"\n=== Training facies head on {n_train} denoised inlines, "
+          f"scoring on {n_val} held-out ones ===")
+    train_secs, train_labs, train_idx = gather("train", n_train)
+    val_secs, val_labs, val_idx = gather("val", n_val)
+    print(f"[facies] train inlines {train_idx[0]}..{train_idx[-1]}, "
+          f"held-out inlines {val_idx.tolist()}")
+
+    model, stats = train_facies_multi(cfg, train_secs, train_labs, val_secs, val_labs, device)
+    torch.save(model.state_dict(), run_dir / "facies.pt")
+    stats["val_inlines"] = val_idx.tolist()
+    return stats
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Train the interpretation heads (fault segmentation, facies) on denoised data.")
     parser.add_argument("--config", type=str, default="configs/default.yaml")
     parser.add_argument("--skip-stretch", action="store_true", help="skip diffusion + facies (faster run)")
+    parser.add_argument("--blindspot", type=str, default="runs/denoise_field/blindspot.pt",
+                        help="blind-spot denoiser checkpoint to feed the heads")
+    parser.add_argument("--train-legacy-denoiser", action="store_true",
+                        help="also train the superseded masking denoiser (ON/OFF pair), so it can "
+                             "be scored against the current one by deepseis.evaluate --legacy")
     parser.add_argument("--resume", action="store_true",
-                         help="resume denoiser training from the last periodic checkpoint, if present "
-                              "(useful for long CPU runs split across multiple sessions)")
+                         help="resume legacy denoiser training from the last periodic checkpoint")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -530,19 +679,31 @@ def main() -> None:
 
     results: dict = {"config_path": str(args.config)}
 
-    # ---- Stage 1: denoiser, trained twice (fault-preservation ON vs OFF) ----
-    print("\n=== Training denoiser: fault-preservation OFF ===")
-    model_off, hist_off = train_denoiser(cfg, noisy, fault_preservation_enabled=False, device=device,
-                                          checkpoint_path=run_dir / "training_ckpt_off.pt", resume=args.resume)
-    denoised_off = run_denoiser_inference(model_off, noisy, cfg, device)
+    # ---- Stage 1: denoise ----
+    denoise_fn, denoiser_label = resolve_denoiser(cfg, args, device, fallback_section=noisy)
+    print(f"\n=== Denoising with the {denoiser_label} model ===", flush=True)
+    # raw_noisy, not noisy: the blind-spot path normalises internally, so
+    # handing it the pre-normalised array would scale the section twice.
+    denoised_on = denoise_fn(data.get("raw_noisy", noisy))
+    results["denoiser"] = denoiser_label
 
-    print("\n=== Training denoiser: fault-preservation ON ===")
-    model_on, hist_on = train_denoiser(cfg, noisy, fault_preservation_enabled=True, device=device,
-                                        checkpoint_path=run_dir / "training_ckpt_on.pt", resume=args.resume)
-    denoised_on = run_denoiser_inference(model_on, noisy, cfg, device)
+    denoised_off = denoised_on
+    if args.train_legacy_denoiser:
+        print("\n=== Training legacy denoiser: structure loss OFF ===", flush=True)
+        model_off, hist_off = train_denoiser(cfg, noisy, fault_preservation_enabled=False, device=device,
+                                             checkpoint_path=run_dir / "training_ckpt_off.pt",
+                                             resume=args.resume)
+        denoised_off = run_denoiser_inference(model_off, noisy, cfg, device)
 
-    torch.save(model_on.state_dict(), run_dir / cfg["output"]["checkpoint_name"])
-    torch.save(model_off.state_dict(), run_dir / ("off_" + cfg["output"]["checkpoint_name"]))
+        print("\n=== Training legacy denoiser: structure loss ON ===", flush=True)
+        model_on, hist_on = train_denoiser(cfg, noisy, fault_preservation_enabled=True, device=device,
+                                           checkpoint_path=run_dir / "training_ckpt_on.pt",
+                                           resume=args.resume)
+        torch.save(model_on.state_dict(), run_dir / cfg["output"]["checkpoint_name"])
+        torch.save(model_off.state_dict(), run_dir / ("off_" + cfg["output"]["checkpoint_name"]))
+        results["history_off"] = hist_off
+        results["history_on"] = hist_on
+
     np.save(run_dir / "noisy.npy", noisy)
     np.save(run_dir / "denoised_on.npy", denoised_on)
     np.save(run_dir / "denoised_off.npy", denoised_off)
@@ -564,16 +725,16 @@ def main() -> None:
                                        "snr_db": metrics_mod.snr_db(denoised_off, clean),
                                        "ssim": metrics_mod.ssim(denoised_off, clean)},
         }
-        print("\n[metrics] denoising (synthetic, clean available):")
-        print(json.dumps(results["denoise_metrics"], indent=2))
+        print("\n[metrics] denoising (synthetic, clean available):", flush=True)
+        print(json.dumps(results["denoise_metrics"], indent=2), flush=True)
     else:
-        print("\n[metrics] real data mode — no clean reference, skipping PSNR/SSIM (expected).")
+        print("\n[metrics] real data mode — no clean reference, skipping PSNR/SSIM (expected).", flush=True)
 
     # ---- Stage 2: FaultSeg head ----
     # Always trains on the synthetic clean+fault data (syn_clean / syn_fault_mask),
     # mirroring how the real FaultSeg3D paper trains on synthetic and infers on field data.
     # For synthetic mode syn_clean == clean, so behaviour is identical to before.
-    print("\n=== Training FaultSeg head (on synthetic clean data) ===")
+    print("\n=== Training FaultSeg head (on synthetic clean data) ===", flush=True)
     faultseg_model = train_faultseg(cfg, syn_clean, syn_fault_mask, device)
     torch.save(faultseg_model.state_dict(), run_dir / cfg["output"]["faultseg_checkpoint_name"])
 
@@ -588,46 +749,35 @@ def main() -> None:
         m_denoised = metrics_mod.fault_metrics(prob_denoised, fault_mask, threshold=cfg["faultseg"]["dice_threshold"])
         results["fault_metrics"] = {"noisy_input": dataclasses_asdict(m_noisy),
                                      "denoised_input": dataclasses_asdict(m_denoised)}
-        print("\n[metrics] fault segmentation delta (noisy vs denoised input):")
-        print(json.dumps(results["fault_metrics"], indent=2))
+        print("\n[metrics] fault segmentation delta (noisy vs denoised input):", flush=True)
+        print(json.dumps(results["fault_metrics"], indent=2), flush=True)
     else:
-        print("\n[metrics] real data mode — no fault GT, skipping Dice/precision/recall (expected).")
-        print("          Fault-probability overlays saved to runs/default/fault_prob_*.npy for visual QC.")
+        print("\n[metrics] real data mode — no fault GT, skipping Dice/precision/recall (expected).", flush=True)
+        print("          Fault-probability overlays saved to runs/default/fault_prob_*.npy for visual QC.", flush=True)
 
-    # ---- Stretch: facies + diffusion ----
-    if not args.skip_stretch and facies is not None and cfg["facies"]["enabled"]:
-        # Real F3 facies labels — retrain the facies head on them.
-        # facies is already the 2D slice matching the noisy section (from prepare_data).
-        print("\n=== Training facies head on real F3 labels (stretch) ===")
-        n_classes_actual = int(facies.max()) + 1
-        print(f"[facies] using {n_classes_actual} classes detected from F3 labels (0..{n_classes_actual-1})")
-        facies_input = denoised_on if clean is None else clean
-        facies_model = train_facies(cfg, facies_input, facies, device)
-        torch.save(facies_model.state_dict(), run_dir / "facies.pt")
-    elif not args.skip_stretch and clean is not None and data.get("facies") is not None and cfg["facies"]["enabled"]:
-        print("\n=== Training facies head (stretch) ===")
-        facies_model = train_facies(cfg, clean, data["facies"], device)
-        torch.save(facies_model.state_dict(), run_dir / "facies.pt")
+    # ---- Facies head: many inlines, scored on held-out ones ----
+    if not args.skip_stretch and cfg["facies"]["enabled"] and facies is not None:
+        facies_result = train_facies_head(cfg, denoise_fn, run_dir, device)
+        if facies_result is not None:
+            results["facies_metrics"] = facies_result
 
     if not args.skip_stretch and cfg["diffusion"]["enabled"]:
-        print("\n=== Training diffusion refiner (stretch) ===")
-        diffusion = train_diffusion(cfg, denoised_on, device)
+        print("\n=== Training diffusion refiner (stretch) ===", flush=True)
+        diffusion = train_diffusion(cfg, noisy, device)
         torch.save(diffusion.model.state_dict(), run_dir / cfg["output"]["diffusion_checkpoint_name"])
         refined = refine_with_diffusion(diffusion, denoised_on, cfg, device)
         np.save(run_dir / "refined.npy", refined)
         if clean is not None:
             results["diffusion_metrics"] = {"psnr": metrics_mod.psnr(refined, clean),
                                              "ssim": metrics_mod.ssim(refined, clean)}
-            print("\n[metrics] diffusion-refined vs clean:", results["diffusion_metrics"])
+            print("\n[metrics] diffusion-refined vs clean:", results["diffusion_metrics"], flush=True)
 
-    results["history_off"] = hist_off
-    results["history_on"] = hist_on
     results["elapsed_seconds"] = time.time() - t0
 
     with open(run_dir / "results.json", "w") as f:
         json.dump(results, f, indent=2)
 
-    print(f"\n[deepseis] done in {results['elapsed_seconds']:.1f}s. Artifacts written to {run_dir}/")
+    print(f"\n[deepseis] done in {results['elapsed_seconds']:.1f}s. Artifacts written to {run_dir}/", flush=True)
 
 
 def dataclasses_asdict(obj) -> dict:

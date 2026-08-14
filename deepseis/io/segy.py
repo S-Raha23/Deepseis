@@ -18,16 +18,22 @@ import numpy as np
 import segyio
 
 
-def load_volume(path: str | Path) -> np.ndarray:
+def load_volume(path: str | Path, mmap: bool = False) -> np.ndarray:
     """Load a seismic volume from ``.npy``, ``.sgy``/``.segy``, or a raw FaultSeg3D-style ``.dat``.
 
     Returns a 2D array ``(n_samples, n_traces)`` for a single inline/section,
     or a 3D array ``(n_inlines, n_crosslines, n_samples)`` for a full SEG-Y
     survey (post-stack, regularly gridded).
+
+    ``mmap=True`` memory-maps a ``.npy`` volume instead of reading it, which
+    matters whenever only a few sections are needed. F3 is stored as float64,
+    so a full read costs 573 MB before any float32 copy is made, while one
+    inline read through a memory map costs 0.72 MB. On a 1 GB hosting tier the
+    difference is the whole application.
     """
     path = Path(path)
     if path.suffix == ".npy":
-        return np.load(path)
+        return np.load(path, mmap_mode="r") if mmap else np.load(path)
     if path.suffix.lower() in (".sgy", ".segy"):
         return _load_segy_volume(path)
     if path.suffix.lower() == ".dat":

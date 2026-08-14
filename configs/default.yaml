@@ -43,7 +43,17 @@ data:
 # Blind-spot masking
 # ---------------------------------------------------------------------------
 masking:
-  mode: "auto"                   # "n2v" | "struct_n2v" | "auto" (estimate from data)
+  # NOT "auto". The estimator behind it does not separate coherent noise from
+  # coherent signal -- its own docstring records calling white-noise synthetic
+  # 100% "coherent" -- and on real F3 it routed 76% of patches to struct_n2v,
+  # whose blind region then replaced 97.9% of each patch. Set this explicitly
+  # for a survey you know.
+  #
+  # This whole path is the legacy masking denoiser, kept so the previous model
+  # can be loaded and scored against the current one. New work should use the
+  # blind-spot denoiser (configs/denoise.yaml), whose blind spot is a property
+  # of the architecture and is verified by autograd rather than by masking.
+  mode: "n2v"                    # "n2v" | "struct_n2v" | "auto" (unreliable, see above)
   n2v:
     mask_fraction: 0.02           # swept 0.01/0.02/0.05/0.12 on real F3, scored by signal
                                    # leakage: 0.02 -> 0.280, 0.12 -> 0.514. The old 0.12 was
@@ -54,8 +64,11 @@ masking:
     neighborhood_radius: 5        # radius for the "swap" replacement strategy
   struct_n2v:
     mask_fraction: 0.02
-    blind_shape: "trace"          # "trace" (vertical stripe) | "horizontal" | "diagonal"
-    blind_width: 3                # width of the blind stripe, in pixels
+    blind_shape: "trace"          # "trace" (vertical) | "horizontal" | "diagonal"
+    blind_width: 3                # width of the blind segment, across the noise direction
+    blind_length: 9               # length along it -- must cover the noise correlation
+                                   # length, NOT the whole patch
+    max_blind_fraction: 0.35      # hard ceiling on how much of a patch may be blinded
 
 # ---------------------------------------------------------------------------
 # Denoiser model + training
@@ -122,6 +135,12 @@ facies:
   epochs: 24                      # was hardcoded at 6, which stopped the head underfit
   enabled: true
   n_classes: 6   # F3 Netherlands has 6 lithostratigraphic facies classes (0-5, Alaudah et al. 2019)
+  # Trained across the survey and scored on held-out inlines, using the same
+  # buffered split layout as the denoiser. The previous head was fitted on
+  # inline 0 and reported on inline 0, so its 94.4% could not distinguish
+  # fitting from generalising.
+  n_train_sections: 24
+  n_val_sections: 6
 
 # ---------------------------------------------------------------------------
 # Output paths

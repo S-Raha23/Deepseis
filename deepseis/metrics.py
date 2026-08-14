@@ -96,6 +96,94 @@ def local_similarity_map_fast(noisy: np.ndarray, denoised: np.ndarray, window: i
     return cov / (np.sqrt(var_a * var_b) + 1e-8)
 
 
+def leakage_score(noisy: np.ndarray, denoised: np.ndarray, window: int = 9) -> float:
+    """Mean absolute local similarity between what was removed and what was kept.
+
+    Lower is better, but it must never be read on its own: a filter that
+    removes nothing scores a perfect 0.0, so this number is only meaningful
+    beside :func:`energy_removed_fraction`. The project's previous headline
+    figure (0.334) was achieved by a model that removed 1.8% of the input
+    variance, which is most of why it looked good.
+    """
+    return float(np.abs(local_similarity_map_fast(noisy, denoised, window)).mean())
+
+
+def energy_removed_fraction(noisy: np.ndarray, denoised: np.ndarray) -> float:
+    """Fraction of the input's variance that ended up in the removed section."""
+    removed = noisy.astype(np.float64) - denoised.astype(np.float64)
+    return float(removed.var() / (noisy.astype(np.float64).var() + 1e-30))
+
+
+def spectral_retention(noisy: np.ndarray, denoised: np.ndarray,
+                       edges: tuple[float, ...] = (0.0, 0.2, 0.4, 0.6, 0.8, 1.001)) -> dict[str, float]:
+    """Fraction of energy kept in each radial F-K band.
+
+    The signature of over-smoothing is a monotone collapse towards the high
+    bands while the low bands are untouched -- i.e. a low-pass filter. Reading
+    the profile is far more diagnostic than any single scalar.
+    """
+    n = np.asarray(noisy, dtype=np.float64)
+    d = np.asarray(denoised, dtype=np.float64)
+    h, w = n.shape
+    fy = np.fft.fftfreq(h)[:, None]
+    fx = np.fft.fftfreq(w)[None, :]
+    radial = np.sqrt(fy ** 2 + fx ** 2) / 0.5
+
+    spec_n = np.abs(np.fft.fft2(n)) ** 2
+    spec_d = np.abs(np.fft.fft2(d)) ** 2
+
+    out = {}
+    for lo, hi in zip(edges, edges[1:]):
+        band = (radial >= lo) & (radial < hi)
+        out[f"{lo:.1f}-{min(hi, 1.0):.1f}"] = float(spec_d[band].sum() / (spec_n[band].sum() + 1e-30))
+    return out
+
+
+def semblance_map(section: np.ndarray, win_t: int = 9, win_x: int = 5) -> np.ndarray:
+    """Taner-style local semblance in ``[0, 1]`` (numpy twin of the torch version)."""
+    from scipy.ndimage import uniform_filter
+
+    x = np.asarray(section, dtype=np.float64)
+    stacked = uniform_filter(x, size=(1, win_x)) * win_x
+    num = uniform_filter(stacked ** 2, size=(win_t, 1))
+    den = uniform_filter(uniform_filter(x ** 2, size=(1, win_x)) * win_x, size=(win_t, 1)) * win_x
+    return num / (den + 1e-12)
+
+
+def residual_coherence(noisy: np.ndarray, denoised: np.ndarray,
+                       win_t: int = 9, win_x: int = 5) -> float:
+    """Mean semblance of the *removed* section.
+
+    This is the number a processor arrives at by eye when they display the
+    difference section and look for events in it. Random noise is incoherent,
+    so a clean removal has low semblance; coherent structure in the residual
+    means geology was taken out. It is complementary to the leakage score:
+    leakage asks whether the residual correlates with the *output*, this asks
+    whether the residual is organised at all.
+    """
+    removed = np.asarray(noisy, dtype=np.float64) - np.asarray(denoised, dtype=np.float64)
+    if removed.std() < 1e-12:
+        return 0.0
+    return float(semblance_map(removed, win_t, win_x).mean())
+
+
+def denoising_report(noisy: np.ndarray, denoised: np.ndarray,
+                     clean: np.ndarray | None = None) -> dict:
+    """All no-reference denoising diagnostics, plus referenced ones when available."""
+    report = {
+        "leakage": leakage_score(noisy, denoised),
+        "energy_removed_fraction": energy_removed_fraction(noisy, denoised),
+        "residual_coherence": residual_coherence(noisy, denoised),
+        "output_std_ratio": float(denoised.std() / (noisy.std() + 1e-30)),
+        "spectral_retention": spectral_retention(noisy, denoised),
+    }
+    if clean is not None:
+        report["psnr"] = psnr(denoised, clean)
+        report["ssim"] = ssim(denoised, clean)
+        report["snr_db"] = snr_db(denoised, clean)
+    return report
+
+
 # ---------------------------------------------------------------------------
 # Fault segmentation metrics
 # ---------------------------------------------------------------------------

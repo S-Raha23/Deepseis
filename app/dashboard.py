@@ -8,6 +8,7 @@ Run with:
 from __future__ import annotations
 
 import io
+import os
 import sys
 import time
 from pathlib import Path
@@ -42,23 +43,76 @@ FACIES_COLORS = ["#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00", "#a65628
 # Cached loaders
 # ---------------------------------------------------------------------------
 
+def artifact_key(*paths) -> tuple:
+    """Modification times of the files a cached loader depends on.
+
+    Streamlit's caches are keyed on a function's *arguments*, so a loader that
+    takes no arguments -- or only a path that never changes -- can never
+    invalidate. Retraining a model then leaves the dashboard serving the
+    previous one indefinitely, with no error and no visible sign; the page just
+    keeps showing yesterday's numbers. Threading the artifacts' mtimes through
+    as an argument makes the cache notice when they are rewritten.
+    """
+    out = []
+    for path in paths:
+        f = Path(path)
+        out.append(f.stat().st_mtime if f.exists() else 0.0)
+    return tuple(out)
+
+
 @st.cache_data(show_spinner=False)
 def load_cfg(config_path: str) -> dict:
     return load_config(config_path)
 
 
+#: Single source for every artifact the deployed app needs. Overridable so a
+#: fork or a private mirror does not require a code edit.
+HF_DATASET = os.environ.get("DEEPSEIS_HF_DATASET", "SRaha23/Seismic_Data")
+
+
+@st.cache_data(show_spinner=False)
+def fetch_artifact(remote_path: str, local_candidates: tuple[str, ...] = ()) -> str | None:
+    """Resolve one artifact to a local file path, preferring a local copy.
+
+    A local file wins when present: on a development machine the data and
+    checkpoints already exist, and re-downloading them would be slow and would
+    risk serving a different copy from the one the models were fitted on.
+    Otherwise the file is pulled from the Hugging Face dataset, which is what
+    the deployed app does since it starts with an empty filesystem.
+
+    Returns ``None`` rather than raising if the artifact is nowhere to be
+    found, so a missing optional checkpoint disables one tab instead of taking
+    down the whole page.
+    """
+    for candidate in local_candidates:
+        if Path(candidate).exists():
+            return str(candidate)
+
+    try:
+        from huggingface_hub import hf_hub_download
+
+        return hf_hub_download(
+            repo_id=HF_DATASET, filename=remote_path, repo_type="dataset",
+            local_dir=str(Path.home() / ".cache" / "deepseis"),
+        )
+    except Exception:
+        return None
+
+
 @st.cache_data(show_spinner=False)
 def fetch_f3_from_hf() -> tuple[str, str]:
-    from huggingface_hub import hf_hub_download
-    seismic_path = hf_hub_download(
-        repo_id="SRaha23/f3-netherlands", filename="train_seismic.npy",
-        repo_type="dataset", local_dir="/tmp/f3",
-    )
-    labels_path = hf_hub_download(
-        repo_id="SRaha23/f3-netherlands", filename="train_labels.npy",
-        repo_type="dataset", local_dir="/tmp/f3",
-    )
-    return seismic_path, labels_path
+    """Locate the seismic volume and its facies labels."""
+    seismic = fetch_artifact("data/train_seismic.npy",
+                             ("data/raw/f3/data/train/train_seismic.npy",))
+    labels = fetch_artifact("data/train_labels.npy",
+                            ("data/raw/f3/data/train/train_labels.npy",))
+    if seismic is None or labels is None:
+        raise FileNotFoundError(
+            f"Could not find the F3 volume locally or in the '{HF_DATASET}' dataset. "
+            f"Run `python data/download_f3.py`, or check the dataset contains "
+            f"data/train_seismic.npy and data/train_labels.npy."
+        )
+    return seismic, labels
 
 
 @st.cache_data(show_spinner=False)
@@ -67,13 +121,18 @@ def get_demo_section(config_path: str):
     dcfg = cfg["data"]
     if not dcfg.get("use_synthetic", True):
         seismic_path, labels_path = fetch_f3_from_hf()
-        noisy_raw = segy_mod.load_volume(seismic_path)
+        # Memory-mapped: only inline 0 is wanted, and a full read of F3 costs
+        # 573 MB (it is stored as float64) against 0.72 MB for one section.
+        noisy_raw = segy_mod.load_volume(seismic_path, mmap=True)
         if noisy_raw.ndim == 3:
-            noisy_raw = noisy_raw[0].T
+            noisy_raw = np.asarray(noisy_raw[0]).T
+        # Raw amplitude. Everything downstream that needs normalised data
+        # normalises it itself: `serve_section` applies the checkpoint's stored
+        # constants, and the legacy denoiser is fed a unit-std copy at its own
+        # call site. Normalising here as well divided by the scale twice, which
+        # is silent -- the page rendered fine while the denoiser under-removed
+        # by a factor of four.
         noisy = noisy_raw.astype("float32")
-        std = noisy.std()
-        if std > 0:
-            noisy = noisy / std
         labels_vol = np.load(labels_path, mmap_mode="r")
         facies = labels_vol[0].T.astype(np.int64)
         return None, noisy, None, facies
@@ -88,12 +147,20 @@ def get_survey(config_path: str, n_inlines: int):
     return synth_mod.generate_synthetic_survey(n_inlines=n_inlines, random_seed=7)
 
 
-@st.cache_data(show_spinner=False)
-def load_f3_full() -> np.ndarray:
+@st.cache_resource(show_spinner=False)
+def load_f3_full():
+    """A memory-mapped handle to the full survey, not the survey itself.
+
+    The survey explorer only ever displays one inline at a time, so holding
+    the whole cube resident buys nothing and costs 573 MB -- enough on its own
+    to exhaust a 1 GB hosting tier. `cache_resource` rather than `cache_data`
+    because the latter pickles what it caches, which would materialise the
+    memory map straight back into RAM.
+
+    Raw amplitude, for the same reason as get_demo_section.
+    """
     seismic_path, _ = fetch_f3_from_hf()
-    vol = segy_mod.load_volume(seismic_path)
-    std = vol.std()
-    return (vol / (std + 1e-8)).astype("float32")
+    return segy_mod.load_volume(seismic_path, mmap=True)
 
 
 def checkpoints_exist(run_dir: Path, cfg: dict) -> bool:
@@ -102,30 +169,40 @@ def checkpoints_exist(run_dir: Path, cfg: dict) -> bool:
 
 
 @st.cache_resource(show_spinner=False)
-def load_models(config_path: str, run_dir_str: str):
+def load_models(config_path: str, run_dir_str: str, cache_key: tuple = ()):
     cfg = load_cfg(config_path)
     run_dir = Path(run_dir_str)
     device = get_device(cfg)
 
-    model_on = DenoiserUNet(**cfg["model"]["denoiser"]).to(device)
-    model_on.load_state_dict(torch.load(run_dir / cfg["output"]["checkpoint_name"], map_location=device))
-    model_on.eval()
+    # Every checkpoint resolves through fetch_artifact so a fresh deploy, which
+    # starts with no files at all, pulls them from the dataset instead of
+    # crashing on a missing path.
+    name_on = cfg["output"]["checkpoint_name"]
+    on_path = fetch_artifact(f"runs/default/{name_on}", (str(run_dir / name_on),))
+    off_path = fetch_artifact(f"runs/default/off_{name_on}", (str(run_dir / ("off_" + name_on)),))
 
-    model_off = DenoiserUNet(**cfg["model"]["denoiser"]).to(device)
-    model_off.load_state_dict(torch.load(run_dir / ("off_" + cfg["output"]["checkpoint_name"]), map_location=device))
-    model_off.eval()
+    model_on = model_off = None
+    if on_path:
+        model_on = DenoiserUNet(**cfg["model"]["denoiser"]).to(device)
+        model_on.load_state_dict(torch.load(on_path, map_location=device))
+        model_on.eval()
+    if off_path:
+        model_off = DenoiserUNet(**cfg["model"]["denoiser"]).to(device)
+        model_off.load_state_dict(torch.load(off_path, map_location=device))
+        model_off.eval()
 
     faultseg = None
-    faultseg_path = run_dir / cfg["output"]["faultseg_checkpoint_name"]
-    if faultseg_path.exists():
+    fs_name = cfg["output"]["faultseg_checkpoint_name"]
+    faultseg_path = fetch_artifact(f"runs/default/{fs_name}", (str(run_dir / fs_name),))
+    if faultseg_path:
         faultseg = FaultSegNet2D(in_channels=1, base_channels=cfg["faultseg"]["base_channels"],
                                   depth=cfg["faultseg"]["depth"]).to(device)
         faultseg.load_state_dict(torch.load(faultseg_path, map_location=device))
         faultseg.eval()
 
     facies_model = None
-    facies_path = run_dir / "facies.pt"
-    if facies_path.exists():
+    facies_path = fetch_artifact("runs/default/facies.pt", (str(run_dir / "facies.pt"),))
+    if facies_path:
         try:
             # Size the head from the checkpoint itself rather than the config: a
             # facies head fitted on synthetic data has 3 outputs while real F3 has
@@ -144,35 +221,61 @@ def load_models(config_path: str, run_dir_str: str):
     return model_on, model_off, faultseg, facies_model, device
 
 
+@st.cache_resource(show_spinner=False)
+def load_blindspot(checkpoint_path: str, cache_key: tuple = ()):
+    """Load the blind-spot denoiser, or None when it has not been trained yet.
+
+    Returns the model, its noise model, and the normalisation constants stored
+    alongside them. The constants travel with the checkpoint on purpose: the
+    dashboard used to normalise each served section by its own standard
+    deviation while the model had been fitted on an unnormalised volume, a 4.4x
+    mismatch that no amount of retraining would have fixed.
+    """
+    path = Path(checkpoint_path)
+    if not path.exists():
+        return None
+    try:
+        from deepseis.denoise import load_denoiser as _load_blindspot
+        model, noise_model, ckpt = _load_blindspot(path, "cpu")
+        return {"model": model, "noise_model": noise_model, "ckpt": ckpt,
+                "scale": ckpt["normalization"]["scale"],
+                "offset": ckpt["normalization"]["offset"],
+                "epoch": ckpt.get("epoch"), "val": ckpt.get("val", {}),
+                "splits": ckpt.get("splits", {})}
+    except Exception:
+        return None
+
+
+def blindspot_denoise(bundle: dict, section_raw: np.ndarray):
+    """Denoise a raw-amplitude section, returning it in raw amplitude units.
+
+    One pass over the whole section -- no patch grid and no overlap averaging,
+    which the old path needed only because its normalisation layers made a
+    pixel's value depend on which window it fell in.
+    """
+    from deepseis.denoise import serve_section
+
+    denoised, extras = serve_section(bundle["model"], bundle["noise_model"], bundle["ckpt"],
+                                     section_raw, "cpu", return_extras=True)
+    return denoised, extras["uncertainty"]
+
+
 @torch.no_grad()
 def run_facies_inference(model: FaciesNet2D, section: np.ndarray, cfg: dict, device: str) -> np.ndarray:
-    from deepseis.io import patches as patch_mod
-    from deepseis.io.patches import patch_coords
-    from deepseis.train import to_tensor
-    model.eval()
-    pcfg = cfg["data"]["patch"]
-    h, w = section.shape
-    patches = patch_mod.extract_patches(section, pcfg["size"], pcfg["stride"])
-    x = to_tensor(patches, device)
-    logits = model(x)
-    preds = logits.argmax(dim=1).detach().cpu().numpy()
-    coords = patch_coords(h, w, pcfg["size"], pcfg["stride"])
-    size = pcfg["size"]
-    n_cls = int(logits.shape[1])
+    """Delegates to the shared implementation so the dashboard cannot drift
+    from what the head was scored with during training.
 
-    # Majority vote per pixel across the overlapping patches.
-    #
-    # The previous implementation summed the predicted class *indices* and took
-    # the floor of their mean. Averaging categorical labels is not a valid
-    # combination rule: where one patch predicts Lower North Sea (2) and another
-    # Jurassic (4), the mean is 3 -- Rijnland/Chalk, which neither patch
-    # predicted. Because F3's units are stacked in stratigraphic order, that
-    # invented a spurious Rijnland/Chalk band along every 2-to-4 boundary.
-    votes = np.zeros((n_cls, h, w), dtype=np.int16)
-    for (y, x0), patch in zip(coords, preds):
-        ys, xs = np.mgrid[y:y + size, x0:x0 + size]
-        np.add.at(votes, (patch, ys, xs), 1)
-    return votes.argmax(axis=0).astype(np.int32)
+    Patches are combined by majority vote, not by averaging class indices.
+    Averaging categorical labels is not a valid combination rule: where one
+    patch predicts Lower North Sea (2) and another Jurassic (4), the mean is 3
+    -- Rijnland/Chalk, which neither patch predicted. Because F3's units are
+    stacked in stratigraphic order, the earlier version invented a spurious
+    Rijnland/Chalk band along every 2-to-4 boundary.
+    """
+    from deepseis.facies import predict_section
+
+    pcfg = cfg["data"]["patch"]
+    return predict_section(model, section, pcfg["size"], pcfg["stride"], device)
 
 
 def run_training(config_path: str, run_dir: Path) -> None:
@@ -255,7 +358,26 @@ cfg = load_cfg(config_path)
 run_dir = Path(cfg["output"]["run_dir"])
 is_real_data = not cfg["data"].get("use_synthetic", True)
 
-fault_preservation_view = st.sidebar.radio("Fault-preservation loss", ["ON", "OFF", "Side-by-side"], index=2)
+# The blind-spot denoiser is trained separately (configs/denoise.yaml) because
+# it uses the whole volume with held-out splits rather than the single inline
+# the legacy pipeline trains on. The field-mode checkpoint is the one to serve:
+# it is fitted on the raw survey, which is what the dashboard shows. When it is
+# absent the dashboard falls back to the legacy model rather than failing.
+_field = fetch_artifact("runs/denoise_field/blindspot.pt", ("runs/denoise_field/blindspot.pt",))
+BLINDSPOT_CHECKPOINT = Path(_field) if _field else Path("runs/denoise_field/blindspot.pt")
+
+# Only meaningful for the legacy masking denoiser, which was trained twice --
+# once with its structure loss and once without. The current denoiser has no
+# such switch: structure preservation is a property of its posterior-mean
+# estimator, which defers to the observed amplitude wherever the surrounding
+# data fails to predict it, so there is no variant of it that lacks the
+# behaviour. The Denoise tab shows the difference section and the uncertainty
+# map instead, which say more about whether geology survived than an A/B of
+# two loss weightings did.
+fault_preservation_view = st.sidebar.radio(
+    "Legacy denoiser: structure loss", ["ON", "OFF", "Side-by-side"], index=2,
+    help="Applies only to the superseded masking denoiser, shown when the "
+         "blind-spot checkpoint is missing.")
 dice_threshold = st.sidebar.slider("Fault probability threshold", 0.1, 0.9,
                                     cfg["faultseg"]["dice_threshold"], 0.05)
 st.sidebar.markdown("---")
@@ -290,7 +412,7 @@ if is_real_data:
     with startup_progress.container():
         prog = st.progress(0, text="📡 Step 1 / 3 — Downloading F3 Netherlands data from Hugging Face (~640 MB)...")
     with startup_status.container():
-        st.info("Fetching `train_seismic.npy` and `train_labels.npy` from `SRaha23/f3-netherlands` on Hugging Face. This only happens once per session.")
+        st.info("Fetching `train_seismic.npy` and `train_labels.npy` from the `" + HF_DATASET + "` dataset on Hugging Face. This only happens once per session.")
     clean, noisy, fault_mask, facies_labels = get_demo_section(config_path)
 else:
     with startup_progress.container():
@@ -313,12 +435,185 @@ startup_status.empty()
 
 # ── Step 2: load models ─────────────────────────────────────────────────────
 load_prog = st.progress(33, text="⚙️ Step 2 / 3 — Loading pre-trained model checkpoints...")
-model_on, model_off, faultseg, facies_model, device = load_models(config_path, str(run_dir))
+model_on, model_off, faultseg, facies_model, device = load_models(
+    config_path, str(run_dir),
+    artifact_key(run_dir / cfg["output"]["checkpoint_name"],
+                 run_dir / ("off_" + cfg["output"]["checkpoint_name"]),
+                 run_dir / cfg["output"]["faultseg_checkpoint_name"],
+                 run_dir / "facies.pt"))
 load_prog.progress(66, text="🧠 Step 3 / 3 — Running denoiser inference on seismic section...")
 
 # ── Step 3: run inference ───────────────────────────────────────────────────
-denoised_on  = run_denoiser_inference(model_on,  noisy, cfg, device)
-denoised_off = run_denoiser_inference(model_off, noisy, cfg, device)
+# `noisy` is raw amplitude. The legacy masking denoiser has no record of the
+# scale it was fitted at and expects unit-std input, so it is normalised here
+# and its output scaled back; the blind-spot model does this itself from the
+# constants stored in its checkpoint.
+def _legacy_denoise(model, section: np.ndarray) -> np.ndarray:
+    std = float(section.std())
+    if std < 1e-12:
+        return section.astype(np.float32)
+    return run_denoiser_inference(model, (section / std).astype(np.float32), cfg, device) * std
+
+
+denoised_on  = _legacy_denoise(model_on, noisy)
+denoised_off = _legacy_denoise(model_off, noisy)
+
+# The blind-spot denoiser, when it has been trained. Everything downstream
+# (fault segmentation, facies, horizons, export) runs on its output where it is
+# available, because it is the model the evaluation numbers refer to.
+blindspot = load_blindspot(str(BLINDSPOT_CHECKPOINT), artifact_key(BLINDSPOT_CHECKPOINT))
+
+
+def denoise_any(section: np.ndarray) -> np.ndarray:
+    """Denoise a raw-amplitude section with whichever denoiser is available.
+
+    The blind-spot model carries its own normalisation constants; the legacy
+    masking model does not, and was fitted on unit-std data, so it is given a
+    scaled copy here and the result is scaled back.
+    """
+    if blindspot is not None:
+        return blindspot_denoise(blindspot, section)[0]
+    std = float(section.std())
+    if std < 1e-12:
+        return section.astype(np.float32)
+    return run_denoiser_inference(model_on, (section / std).astype(np.float32),
+                                  cfg, device) * std
+
+
+uncertainty = None
+if blindspot is not None:
+    denoised_primary, uncertainty = blindspot_denoise(blindspot, noisy)
+else:
+    denoised_primary = denoised_on
+
+
+# ---------------------------------------------------------------------------
+# Controlled demonstration
+# ---------------------------------------------------------------------------
+#
+# Raw F3 is migrated, stacked, commercially processed data with very little
+# incoherent noise left in it, so a correctly calibrated denoiser run on it
+# removes ~0.1% of the variance and there is visibly nothing to see. That is
+# the honest answer, but it makes for a demonstration that demonstrates
+# nothing.
+#
+# The controlled experiment is the one the whole evaluation rests on: add a
+# *known* amount of noise to a real section, denoise it with the model trained
+# on contaminated data only, and compare against the original. Real geology, a
+# real reference, and every number exact. It is labelled as an experiment
+# rather than dressed up as raw-data performance.
+
+@st.cache_resource(show_spinner=False)
+def load_benchmark_denoiser(cache_key: tuple = ()):
+    path = fetch_artifact("runs/denoise/blindspot.pt", ("runs/denoise/blindspot.pt",))
+    return load_blindspot(path) if path else None
+
+
+@st.cache_data(show_spinner=False)
+def load_facies_metrics(cache_key: tuple = ()):
+    """Held-out facies scores written by `deepseis.fit_facies`."""
+    import json
+
+    resolved = fetch_artifact("runs/default/facies_metrics.json",
+                              ("runs/default/facies_metrics.json",))
+    if resolved is None:
+        return None
+    path = Path(resolved)
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner=False)
+def load_benchmark_table(cache_key: tuple = ()):
+    """The evaluation report, formatted for display.
+
+    Read from disk rather than recomputed: it is produced by
+    `python -m deepseis.evaluate`, which is the same code path the README
+    numbers come from, so the app cannot quietly disagree with the write-up.
+    """
+    import json
+
+    resolved = fetch_artifact("runs/denoise/evaluation_final.json",
+                              ("runs/denoise/evaluation_final.json",
+                               "runs/denoise/evaluation.json"))
+    if resolved is None:
+        return None
+    path = Path(resolved)
+
+    with open(path) as f:
+        report = json.load(f)
+    if not report.get("has_reference"):
+        return None
+
+    pretty = {
+        "blindspot": "DeepSeis blind-spot",
+        "blindspot+ortho": "DeepSeis + orthogonalization",
+        "blindspot+persection_sigma": "DeepSeis + per-section sigma",
+        "structure_OFF": "DeepSeis (structure terms off)",
+        "legacy_masking_n2v": "Previous denoiser (masking N2V)",
+        "fx_decon": "f-x deconvolution",
+        "structure_oriented": "Structure-oriented smoothing",
+        "median_3": "3x3 median",
+        "gaussian_1.0": "Gaussian sigma=1.0",
+        "gaussian_0.5": "Gaussian sigma=0.5",
+        "identity": "Identity (removes nothing)",
+    }
+    rows = []
+    for name, r in report["methods"].items():
+        rows.append({
+            "Method": pretty.get(name, name),
+            "SNR dB": round(r["snr_db"], 2),
+            "+/-": round(r.get("snr_db_std", 0.0), 2),
+            "PSNR": round(r["psnr"], 2),
+            "SSIM": round(r["ssim"], 3),
+            "Leakage": round(r["leakage"], 3),
+            "Removed": round(r["energy_removed_fraction"], 3),
+            "Resid. coh.": round(r["residual_coherence"], 3),
+            "faultDice": round(r["fault_dice_vs_clean"], 3) if "fault_dice_vs_clean" in r else None,
+        })
+    rows.sort(key=lambda d: -d["SNR dB"])
+    return {"table": pd.DataFrame(rows), "n_sections": report["n_sections"],
+            "section_indices": report["section_indices"]}
+
+
+@st.cache_data(show_spinner=False)
+def make_controlled_demo(inline_idx: int, random_std: float, coherent_amp: float,
+                         cache_key: tuple = ()):
+    """Return (clean, noisy, denoised, metrics) for one held-out inline."""
+    from deepseis.denoise import serve_section
+    from deepseis.io.dataset import SeismicVolume, inject_noise
+
+    bundle = load_benchmark_denoiser(artifact_key("runs/denoise/blindspot.pt"))
+    if bundle is None:
+        return None
+
+    seismic_path, _ = fetch_f3_from_hf()
+    volume = SeismicVolume(seismic_path, buffer=30)
+    volume.scale = bundle["scale"]
+    volume.offset = bundle["offset"]
+
+    # Raw amplitude, not normalised. `serve_section` applies the checkpoint's
+    # own normalisation, so handing it pre-normalised data divides by the scale
+    # twice -- and because sigma_n is a fixed physical noise level while the
+    # network is scale equivariant, the effect is silent under-denoising rather
+    # than an obvious blow-up. Caught here by the demo removing 5.6% of the
+    # variance where the same model removes 21% in the benchmark.
+    clean = volume.inline(int(inline_idx), normalized=False)
+    contaminated = inject_noise(clean, {"random_std": random_std,
+                                        "coherent_amp": coherent_amp,
+                                        "n_coherent_events": 3}, seed=1234 + int(inline_idx))
+    denoised = serve_section(bundle["model"], bundle["noise_model"], bundle["ckpt"],
+                             contaminated, "cpu")
+
+    report = metrics_mod.denoising_report(contaminated, denoised, clean)
+    report["input_snr_db"] = metrics_mod.snr_db(contaminated, clean)
+    report["split"] = ("test" if volume.splits.contains("test", int(inline_idx))
+                       else "val" if volume.splits.contains("val", int(inline_idx))
+                       else "train")
+    return clean, contaminated, denoised, report
 
 load_prog.progress(100, text="✅ Ready! All results loaded.")
 time.sleep(0.4)
@@ -330,25 +625,182 @@ load_prog.empty()
 # ---------------------------------------------------------------------------
 
 with tab_denoise:
-    st.subheader("F3 Netherlands — Noisy → Denoised, fault-preservation loss toggled")
-    cols = st.columns(3 if fault_preservation_view == "Side-by-side" else 2)
-    with cols[0]:
-        st.plotly_chart(seismic_heatmap(noisy, "F3 raw input (inline 0)"),
-                        use_container_width=True, key="denoise_noisy")
-    if fault_preservation_view == "Side-by-side":
-        with cols[1]:
-            st.plotly_chart(seismic_heatmap(denoised_off, "Denoised — fault-preservation OFF"),
-                            use_container_width=True, key="denoise_off")
-        with cols[2]:
-            st.plotly_chart(seismic_heatmap(denoised_on, "Denoised — fault-preservation ON"),
-                            use_container_width=True, key="denoise_on")
+    if blindspot is None:
+        st.subheader("F3 Netherlands — Noisy → Denoised, fault-preservation loss toggled")
+        st.warning(
+            "The blind-spot denoiser has not been trained yet, so this is the legacy "
+            "masking model. Train the current one with "
+            "`python -m deepseis.denoise --config configs/denoise.yaml`."
+        )
+        cols = st.columns(3 if fault_preservation_view == "Side-by-side" else 2)
+        with cols[0]:
+            st.plotly_chart(seismic_heatmap(noisy, "F3 raw input (inline 0)"),
+                            width='stretch', key="denoise_noisy")
+        if fault_preservation_view == "Side-by-side":
+            with cols[1]:
+                st.plotly_chart(seismic_heatmap(denoised_off, "Denoised — fault-preservation OFF"),
+                                width='stretch', key="denoise_off")
+            with cols[2]:
+                st.plotly_chart(seismic_heatmap(denoised_on, "Denoised — fault-preservation ON"),
+                                width='stretch', key="denoise_on")
+        else:
+            shown = denoised_on if fault_preservation_view == "ON" else denoised_off
+            with cols[1]:
+                st.plotly_chart(seismic_heatmap(shown, f"Denoised — fault-preservation {fault_preservation_view}"),
+                                width='stretch', key="denoise_single")
     else:
-        shown = denoised_on if fault_preservation_view == "ON" else denoised_off
-        with cols[1]:
-            st.plotly_chart(seismic_heatmap(shown, f"Denoised — fault-preservation {fault_preservation_view}"),
-                            use_container_width=True, key="denoise_single")
+        st.subheader("F3 Netherlands — input, denoised, and what was removed")
 
-    st.markdown("**\"Ordinary denoisers erase the geology. Ours protects it.\"** — toggle above to see it live.")
+        removed = noisy - denoised_primary
+        cols = st.columns(3)
+        with cols[0]:
+            st.plotly_chart(seismic_heatmap(noisy, "F3 raw input (inline 0)"),
+                            width='stretch', key="denoise_noisy")
+        with cols[1]:
+            st.plotly_chart(seismic_heatmap(denoised_primary, "Denoised (blind-spot posterior mean)"),
+                            width='stretch', key="denoise_primary")
+        with cols[2]:
+            st.plotly_chart(seismic_heatmap(removed, "Removed (difference section)"),
+                            width='stretch', key="denoise_removed")
+
+        st.caption(
+            "The difference section is the panel that decides whether a denoiser is "
+            "any good, and it is the one a processor looks at first. It should look "
+            "like noise. Any reflector, fault, or channel edge visible in it is "
+            "geology that was taken out of the image on the left."
+        )
+
+        st.info(
+            "**Why this looks like almost nothing happened — it is supposed to.** F3's "
+            "published volume is migrated, stacked, commercially processed data, and its "
+            "measured incoherent noise level is very low, so a correctly calibrated "
+            "denoiser removes about 0.1% of the variance here. A model that visibly "
+            "changed this section would be removing geology. The capability is "
+            "demonstrated under controlled conditions below, where the noise is known "
+            "and the answer can be checked."
+        )
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Signal leakage", f"{metrics_mod.leakage_score(noisy, denoised_primary):.3f}",
+                  help="Local correlation between what was removed and what was kept. "
+                       "Lower is better, but read it next to 'energy removed' — a filter "
+                       "that removes nothing scores a perfect 0.000.")
+        m2.metric("Energy removed", f"{metrics_mod.energy_removed_fraction(noisy, denoised_primary):.1%}",
+                  help="Fraction of the input variance that ended up in the difference section.")
+        m3.metric("Residual coherence", f"{metrics_mod.residual_coherence(noisy, denoised_primary):.3f}",
+                  help="How organised the removed section is. Random noise is incoherent, "
+                       "so a high value means structure was removed.")
+        m4.metric("Output / input std", f"{denoised_primary.std() / (noisy.std() + 1e-12):.3f}",
+                  help="A denoiser should sit slightly below 1.0. Above 1.0 means it is "
+                       "adding energy, which the previous model did (1.247).")
+
+        if uncertainty is not None:
+            with st.expander("Per-pixel uncertainty — where the denoiser is guessing"):
+                st.plotly_chart(
+                    seismic_heatmap(uncertainty, "Posterior standard deviation"),
+                    width='stretch', key="denoise_uncertainty")
+                st.caption(
+                    "The model predicts a distribution, not a point, so it reports how "
+                    "confident it is at every pixel. Uncertainty is high exactly where "
+                    "the surrounding data fails to predict a sample — fault cuts, "
+                    "pinch-outs, channel margins — and those are the pixels where the "
+                    "estimator falls back to the observed amplitude instead of smoothing. "
+                    "That is the mechanism by which structure survives denoising here, "
+                    "rather than a penalty term tuned against the reconstruction loss."
+                )
+
+        # -- Controlled experiment: real geology, known noise, exact reference --
+        st.divider()
+        st.subheader("Controlled experiment — real geology, known noise")
+        st.caption(
+            "Known noise is added to a **held-out** real F3 inline, denoised by the model "
+            "trained on contaminated data alone, and compared against the original. This is "
+            "the setup every number in the README comes from: it is the only way to ask "
+            "\"did it remove geology?\" and get an exact answer, because on raw field data "
+            "no clean reference exists."
+        )
+
+        c1, c2, c3 = st.columns([2, 1, 1])
+        demo_inline = c1.slider("Held-out inline", 373, 400, 390, key="demo_inline",
+                                help="Inlines 373-400 are the test block, separated from "
+                                     "training by two 30-line buffers.")
+        demo_std = c2.slider("Random noise", 0.0, 1.0, 0.5, 0.1, key="demo_std",
+                             help="Relative to the section's own amplitude.")
+        demo_coh = c3.slider("Coherent noise", 0.0, 1.0, 0.35, 0.05, key="demo_coh",
+                             help="Steeply dipping, low-frequency events outside the "
+                                  "geological dip fan — ground-roll-like contamination.")
+
+        demo = make_controlled_demo(demo_inline, demo_std, demo_coh,
+                                    artifact_key("runs/denoise/blindspot.pt"))
+        if demo is None:
+            st.warning(
+                "The benchmark denoiser is not trained yet. Run "
+                "`python -m deepseis.denoise --config configs/denoise.yaml`."
+            )
+        else:
+            demo_clean, demo_noisy, demo_denoised, demo_report = demo
+            d1, d2, d3 = st.columns(3)
+            with d1:
+                st.plotly_chart(seismic_heatmap(demo_noisy, f"Input + known noise (inline {demo_inline})"),
+                                width='stretch', key="demo_noisy")
+            with d2:
+                st.plotly_chart(seismic_heatmap(demo_denoised, "Denoised"),
+                                width='stretch', key="demo_denoised")
+            with d3:
+                st.plotly_chart(seismic_heatmap(demo_clean, "Original F3 (the reference)"),
+                                width='stretch', key="demo_clean")
+
+            k1, k2, k3, k4 = st.columns(4)
+            gain = demo_report["snr_db"] - demo_report["input_snr_db"]
+            k1.metric("SNR after", f"{demo_report['snr_db']:.2f} dB", f"{gain:+.2f} dB",
+                      help=f"Input was {demo_report['input_snr_db']:.2f} dB.")
+            k2.metric("SSIM", f"{demo_report['ssim']:.3f}",
+                      help="Structural similarity to the original section.")
+            k3.metric("PSNR", f"{demo_report['psnr']:.2f}")
+            k4.metric("Energy removed", f"{demo_report['energy_removed_fraction']:.1%}",
+                      help="Here there is real noise to remove, so this is ~20% rather "
+                           "than the ~0.1% on raw F3 above.")
+
+            with st.expander("What was removed, and what the model was unsure about"):
+                e1, e2 = st.columns(2)
+                with e1:
+                    st.plotly_chart(
+                        seismic_heatmap(demo_noisy - demo_denoised, "Removed (should be noise only)"),
+                        width='stretch', key="demo_removed")
+                with e2:
+                    st.plotly_chart(
+                        seismic_heatmap(demo_denoised - demo_clean, "Error vs. the original"),
+                        width='stretch', key="demo_error")
+                st.caption(
+                    "The left panel is what the denoiser took out; the right is where it was "
+                    "wrong. On a good result the left looks like unstructured noise and the "
+                    "right is faint and unstructured too — error concentrated along reflectors "
+                    "or faults would mean geology was damaged."
+                )
+
+        # -- Benchmark table --
+        st.divider()
+        bench = load_benchmark_table(artifact_key("runs/denoise/evaluation_final.json",
+                                                  "runs/denoise/evaluation.json"))
+        if bench is not None:
+            st.subheader("Benchmark — held-out test block, all methods")
+            st.caption(
+                f"{bench['n_sections']} sections from inlines {bench['section_indices'][0]}–"
+                f"{bench['section_indices'][-1]}, scored against the known-clean originals. "
+                "`faultDice` is how well the fault head's picks on each method's output agree "
+                "with its picks on the clean section — i.e. how much of the interpretation "
+                "survives the denoising."
+            )
+            st.dataframe(bench["table"], width='stretch', hide_index=True)
+
+        if blindspot.get("val"):
+            val = blindspot["val"]
+            bits = [f"epoch {blindspot['epoch']}"]
+            if "snr_db" in val:
+                bits.append(f"held-out SNR {val['snr_db']:.2f} dB")
+            bits.append(f"held-out leakage {val['leakage']:.3f}")
+            st.caption("Checkpoint selected on held-out validation inlines — " + ", ".join(bits)
+                       + f". Splits: {blindspot.get('splits', {})}")
 
 
 # ---------------------------------------------------------------------------
@@ -362,18 +814,18 @@ with tab_fault:
     else:
         with st.spinner("Running fault segmentation on both inputs..."):
             prob_noisy    = run_faultseg_inference(faultseg, noisy,      cfg, device)
-            prob_denoised = run_faultseg_inference(faultseg, denoised_on, cfg, device)
+            prob_denoised = run_faultseg_inference(faultseg, denoised_primary, cfg, device)
 
         cols = st.columns(3)
         with cols[0]:
             st.plotly_chart(seismic_heatmap(noisy, "F3 raw input"),
-                            use_container_width=True, key="fault_noisy")
+                            width='stretch', key="fault_noisy")
         with cols[1]:
             st.plotly_chart(overlay_heatmap(noisy, prob_noisy, "Fault picks — NOISY", threshold=dice_threshold),
-                            use_container_width=True, key="fault_overlay_noisy")
+                            width='stretch', key="fault_overlay_noisy")
         with cols[2]:
-            st.plotly_chart(overlay_heatmap(denoised_on, prob_denoised, "Fault picks — DENOISED", threshold=dice_threshold),
-                            use_container_width=True, key="fault_overlay_denoised")
+            st.plotly_chart(overlay_heatmap(denoised_primary, prob_denoised, "Fault picks — DENOISED", threshold=dice_threshold),
+                            width='stretch', key="fault_overlay_denoised")
 
         st.markdown("#### Fault-segmentation metrics")
         if fault_mask is not None:
@@ -383,7 +835,7 @@ with tab_fault:
                 "Noisy input":   [fm_n.dice, fm_n.precision, fm_n.recall, fm_n.roc_auc, fm_n.mean_distance_error],
                 "Denoised input":[fm_d.dice, fm_d.precision, fm_d.recall, fm_d.roc_auc, fm_d.mean_distance_error],
             }, index=["Dice","Precision","Recall","ROC-AUC","Mean distance error (px ↓)"])
-            st.dataframe(df.style.format("{:.3f}"), use_container_width=True)
+            st.dataframe(df.style.format("{:.3f}"), width='stretch')
             st.caption("\"Denoising isn't the goal — finding the trap is, and we find more of them.\"")
         else:
             # No ground-truth fault labels for F3 — compute self-referential quality metrics
@@ -470,24 +922,24 @@ with tab_survey:
         n_inlines_f3 = f3_vol.shape[0]
         inline_idx = st.slider("Inline (F3 Netherlands)", 0, n_inlines_f3 - 1, n_inlines_f3 // 2,
                                 help="Scrub through all 401 real inlines.")
-        section_noisy    = f3_vol[inline_idx].T
+        section_noisy    = np.asarray(f3_vol[inline_idx], dtype=np.float32).T
         with st.spinner(f"Running denoiser on inline {inline_idx}..."):
-            section_denoised = run_denoiser_inference(model_on, section_noisy, cfg, device)
+            section_denoised = denoise_any(section_noisy)
     else:
         n_inlines = st.slider("Number of inlines to simulate", 6, 24, 12)
         survey    = get_survey(config_path, n_inlines)
         inline_idx = st.slider("Inline", 0, n_inlines - 1, n_inlines // 2)
         rng = np.random.default_rng(100 + inline_idx)
         section_noisy    = noise_mod.make_noisy(survey.clean[inline_idx], cfg, rng=rng)
-        section_denoised = run_denoiser_inference(model_on, section_noisy, cfg, device)
+        section_denoised = denoise_any(section_noisy)
 
     cols = st.columns(3)
     with cols[0]:
         st.plotly_chart(seismic_heatmap(section_noisy,    f"Inline {inline_idx} — raw"),
-                        use_container_width=True, key="survey_noisy")
+                        width='stretch', key="survey_noisy")
     with cols[1]:
         st.plotly_chart(seismic_heatmap(section_denoised, f"Inline {inline_idx} — denoised"),
-                        use_container_width=True, key="survey_denoised")
+                        width='stretch', key="survey_denoised")
     with cols[2]:
         if faultseg is not None:
             prob = run_faultseg_inference(faultseg, section_denoised, cfg, device)
@@ -497,10 +949,10 @@ with tab_survey:
                                            fault_mask=prob >= dice_threshold)
                 for h in horizons:
                     fig.add_trace(go.Scatter(y=h, mode="lines", line=dict(width=2), showlegend=False))
-            st.plotly_chart(fig, use_container_width=True, key="survey_interpreted")
+            st.plotly_chart(fig, width='stretch', key="survey_interpreted")
         else:
             st.plotly_chart(seismic_heatmap(section_denoised, "Interpreted (retrain FaultSeg to enable)"),
-                            use_container_width=True, key="survey_interp_placeholder")
+                            width='stretch', key="survey_interp_placeholder")
 
     if is_real_data:
         st.caption("**Dataset:** F3 Netherlands · Alaudah et al. 2019 · [Zenodo 3755060](https://zenodo.org/record/3755060) · 401 inlines · 701 crosslines · 255 samples at 4 ms.")
@@ -529,7 +981,7 @@ with tab_facies:
         n_cls = int(max(facies_labels.max(), 0)) + 1
         names = F3_FACIES_NAMES[:n_cls]
         with st.spinner("Classifying facies on the denoised section..."):
-            facies_pred = run_facies_inference(facies_model, denoised_on, cfg, device)
+            facies_pred = run_facies_inference(facies_model, denoised_primary, cfg, device)
 
         agree = facies_pred == facies_labels
         accuracy = float(agree.mean())
@@ -540,25 +992,88 @@ with tab_facies:
             if union:
                 ious.append(int(np.logical_and(pc, gc).sum()) / union)
 
+        held_out = load_facies_metrics(artifact_key("runs/default/facies_metrics.json"))
+
+        st.markdown("**Held-out performance** — inlines the head was never trained on")
+        if held_out is None:
+            st.caption(
+                "No held-out report found. Fit the head with `python -m deepseis.fit_facies`, "
+                "which trains across the survey and scores on a separate block of inlines."
+            )
+        else:
+            h1, h2, h3 = st.columns(3)
+            h1.metric("Held-out mean IoU", f"{held_out['mean_iou'] * 100:.1f}%",
+                      help=f"Averaged over inlines {held_out['val_inlines']}, which are "
+                           f"separated from the training block by a 30-line buffer. "
+                           f"Adjacent F3 inlines correlate at 0.93, so without that buffer "
+                           f"'held-out' would mean nothing.")
+            # From `scored_classes`, not from "which IoUs are non-NaN": a unit
+            # absent from the truth but predicted anyway has an IoU of 0.0
+            # rather than NaN, so counting non-NaN entries reported 6 / 6 when
+            # only 4 units are actually scoreable here.
+            n_scored = len(held_out.get("scored_classes", list(range(n_cls))))
+            h2.metric("Units scored", f"{n_scored} / {n_cls}",
+                      help="Only units actually present in the held-out block can be scored. "
+                           "The other two do not occur there at all.")
+            h3.metric("Best epoch", str(held_out.get("epoch", "—")),
+                      help="Selected on held-out IoU, not on the training loss.")
+
+            per_class = held_out["per_class_iou"]
+            scored = set(held_out.get("scored_classes", list(range(n_cls))))
+            rows = []
+            for c in range(n_cls):
+                value = per_class[c] if c < len(per_class) else float("nan")
+                if c in scored:
+                    rows.append({"Unit": names[c] if c < len(names) else f"class {c}",
+                                 "Held-out IoU": round(float(value), 3) if value == value else None,
+                                 "Status": "scored"})
+                else:
+                    rows.append({"Unit": names[c] if c < len(names) else f"class {c}",
+                                 "Held-out IoU": None,
+                                 "Status": "does not occur in the held-out block"})
+            st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
+
+            absent = [c for c in range(n_cls) if c not in scored]
+            if absent:
+                st.caption(
+                    "Units marked as not occurring in the held-out block are a property of "
+                    "F3's geology, not of the model: they subcrop only in part of the survey. "
+                    "Where the split covers the full stratigraphic column, every unit is "
+                    "scored — see `facies.split_buffer` and `train.facies_split_ranges`, which "
+                    "confine the split to the inline interval in which all units are present."
+                )
+            absent_predicted = held_out.get("classes_absent_but_predicted", [])
+            if absent_predicted:
+                st.caption(
+                    "The head also predicts "
+                    + ", ".join(names[c] if c < len(names) else f"class {c}"
+                                for c in absent_predicted)
+                    + " somewhere in this block, where they do not occur — false positives "
+                    "that do not enter the mean IoU."
+                )
+
+        st.divider()
+        st.markdown("**On the section shown below** — inline 0, which is *inside* the training block")
         m1, m2, m3 = st.columns(3)
         m1.metric("Pixel accuracy", f"{accuracy * 100:.1f}%",
-                   help="Measured on inline 0 — the section the head was fitted on. "
-                        "Goodness of fit, not generalization.")
+                   help="Inline 0 is in the training block, so this is goodness of fit, "
+                        "not generalization. The held-out numbers above are the ones to "
+                        "judge the head by.")
         m2.metric("Mean IoU", f"{np.mean(ious) * 100:.1f}%" if ious else "—",
-                   help="Averaged over classes present in this section.")
+                   help="Averaged over classes present in this section. In-sample.")
         m3.metric("Classes resolved", f"{int((facies_pred[..., None] == np.arange(n_cls)).any((0, 1)).sum())} / {n_cls}",
                    help="How many of the six F3 units the model actually predicts anywhere.")
 
         cols = st.columns(3)
         with cols[0]:
-            st.plotly_chart(seismic_heatmap(denoised_on, "Denoised seismic (inline 0)"),
-                            use_container_width=True, key="facies_seis")
+            st.plotly_chart(seismic_heatmap(denoised_primary, "Denoised seismic (inline 0)"),
+                            width='stretch', key="facies_seis")
         with cols[1]:
             st.plotly_chart(facies_heatmap(facies_pred, "Predicted facies", n_cls),
-                            use_container_width=True, key="facies_pred")
+                            width='stretch', key="facies_pred")
         with cols[2]:
             st.plotly_chart(facies_heatmap(facies_labels, "Ground truth (Alaudah et al. 2019)", n_cls),
-                            use_container_width=True, key="facies_gt")
+                            width='stretch', key="facies_gt")
 
         # Where it is wrong is more useful than the headline score -- a facies map
         # looks geologically plausible even where it disagrees with the labels.
@@ -570,7 +1085,7 @@ with tab_facies:
         err.update_xaxes(title="Trace")
         err.update_layout(title=f"Misclassified pixels — {100 * (1 - accuracy):.1f}% of the section",
                           height=320, margin=dict(l=10, r=10, t=40, b=10))
-        st.plotly_chart(err, use_container_width=True, key="facies_err")
+        st.plotly_chart(err, width='stretch', key="facies_err")
         st.caption("Errors concentrate at unit boundaries, where a patch-based classifier "
                    "has to commit to one label for a window spanning two units.")
 
@@ -585,15 +1100,16 @@ with tab_facies:
                 "Actual (%)": f"{100 * gc.mean():.1f}",
                 "IoU (%)": f"{100 * inter / union:.1f}" if union else "—",
             })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
 
         st.info(
-            "**Read the accuracy as fit, not skill.** The facies head is fitted on inline 0 "
-            "(`train.prepare_data` takes a single section) and scored here on that same "
-            "inline. Treat the map as an interpretation aid; fitting across multiple inlines "
-            "would be needed for a validated classifier.\n\n"
+            "**Read the table above as fit, not skill.** It is computed on inline 0, which is "
+            "inside the training block, so it measures how well the head reproduces data it "
+            "was shown. The held-out numbers at the top of this tab are the ones that say "
+            "anything about generalisation.\n\n"
             "The head runs on the *denoised* section, so it inherits whatever the denoiser "
-            "preserved or removed — one reason the fault-preservation loss matters."
+            "preserved or removed — if denoising were erasing geology, it would show up here "
+            "as a worse held-out score."
         )
 
 
@@ -608,7 +1124,7 @@ with tab_export:
     if st.button("Generate export"):
         if export_format == "NumPy (.npy)":
             buf = io.BytesIO()
-            np.save(buf, denoised_on)
+            np.save(buf, denoised_primary)
             buf.seek(0)
             st.download_button("⬇️ Download denoised_inline0.npy", buf,
                                file_name="denoised_inline0.npy", mime="application/octet-stream")
@@ -618,7 +1134,7 @@ with tab_export:
             with tempfile.NamedTemporaryFile(suffix=".sgy", delete=False) as tmp:
                 tmp_path = tmp.name
             try:
-                segy_mod.write_segy_like(tmp_path, denoised_on, template_path=None,
+                segy_mod.write_segy_like(tmp_path, denoised_primary, template_path=None,
                                           dt_ms=cfg["data"]["synthetic"]["dt_ms"])
                 with open(tmp_path, "rb") as f:
                     buf.write(f.read())
@@ -632,10 +1148,10 @@ with tab_export:
 
     st.markdown("---")
     st.markdown("#### Denoised section preview")
-    st.plotly_chart(seismic_heatmap(denoised_on, "Denoised inline 0 — fault-preservation ON"),
-                    use_container_width=True, key="export_preview")
-    st.caption(f"Shape: {denoised_on.shape[0]} samples × {denoised_on.shape[1]} traces | "
-               f"Range: [{denoised_on.min():.3f}, {denoised_on.max():.3f}]")
+    st.plotly_chart(seismic_heatmap(denoised_primary, "Denoised inline 0"),
+                    width='stretch', key="export_preview")
+    st.caption(f"Shape: {denoised_primary.shape[0]} samples × {denoised_primary.shape[1]} traces | "
+               f"Range: [{denoised_primary.min():.3f}, {denoised_primary.max():.3f}]")
 
 
 # ---------------------------------------------------------------------------
@@ -648,28 +1164,35 @@ with tab_diag:
     st.markdown("#### F-K spectrum — signal survives denoising")
     with st.spinner("Computing F-K spectra..."):
         fk_noisy    = fk_spectrum(torch.from_numpy(noisy)).numpy()
-        fk_denoised = fk_spectrum(torch.from_numpy(denoised_on)).numpy()
+        fk_denoised = fk_spectrum(torch.from_numpy(denoised_primary)).numpy()
     cols = st.columns(2)
     with cols[0]:
         st.plotly_chart(go.Figure(go.Heatmap(z=fk_noisy, colorscale="Viridis"))
                         .update_layout(title="F-K — raw", height=350, margin=dict(l=10,r=10,t=40,b=10)),
-                        use_container_width=True, key="diag_fk_noisy")
+                        width='stretch', key="diag_fk_noisy")
     with cols[1]:
         st.plotly_chart(go.Figure(go.Heatmap(z=fk_denoised, colorscale="Viridis"))
                         .update_layout(title="F-K — denoised", height=350, margin=dict(l=10,r=10,t=40,b=10)),
-                        use_container_width=True, key="diag_fk_denoised")
+                        width='stretch', key="diag_fk_denoised")
 
     st.markdown("#### Signal-leakage map — no geology removed")
     st.caption("Values near zero = removed component is noise, not geology.")
     with st.spinner("Computing local similarity map..."):
-        sim_map = metrics_mod.local_similarity_map_fast(noisy, denoised_on, window=9)
+        sim_map = metrics_mod.local_similarity_map_fast(noisy, denoised_primary, window=9)
     st.plotly_chart(go.Figure(go.Heatmap(z=sim_map, colorscale="RdBu", zmid=0, zmin=-1, zmax=1))
                     .update_layout(title="Local correlation: (noisy − denoised) vs. denoised", height=380,
                                    yaxis=dict(autorange="reversed"), margin=dict(l=10,r=10,t=40,b=10)),
-                    use_container_width=True, key="diag_sim_map")
+                    width='stretch', key="diag_sim_map")
 
-    st.markdown("#### Jacobian mask explainer")
-    st.caption("Pick a pixel — see which inputs the denoiser relies on and what blind-spot mask that implies.")
+    st.markdown("#### Jacobian sensitivity (legacy masking denoiser)")
+    st.caption(
+        "Pick a pixel and see which inputs the **legacy masking** denoiser relies on. "
+        "The mask-shape recommendation below applies only to that model: the current "
+        "denoiser has no mask to design, because its blind spot comes from the "
+        "architecture rather than from corrupting the input. Its equivalent sensitivity "
+        "map is exactly zero at the chosen pixel by construction, which "
+        "`tests/test_blindspot.py` asserts for every pixel."
+    )
     jy = st.slider("Row (sample)",  10, noisy.shape[0]-10, noisy.shape[0]//2, key="jy")
     jx = st.slider("Col (trace)",   10, noisy.shape[1]-10, noisy.shape[1]//2, key="jx")
     if st.button("Compute Jacobian"):
@@ -687,7 +1210,7 @@ with tab_diag:
             st.plotly_chart(go.Figure(go.Heatmap(z=jac, colorscale="Inferno"))
                             .update_layout(title="Sensitivity |d(output)/d(input)|", height=350,
                                            margin=dict(l=10,r=10,t=40,b=10)),
-                            use_container_width=True, key="diag_jacobian")
+                            width='stretch', key="diag_jacobian")
         with c2:
             st.write(f"**Suggested blind shape:** `{suggestion.suggested_blind_shape}`")
             st.write(f"**Suggested blind width:** `{suggestion.suggested_blind_width}` px")

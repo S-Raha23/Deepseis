@@ -42,11 +42,27 @@ def load_faultseg(cfg: dict, checkpoint_path: str | Path, device: str) -> FaultS
     return model
 
 
-def run_pipeline(cfg: dict, section: np.ndarray, run_dir: Path, device: str) -> dict:
-    denoiser = load_denoiser(cfg, run_dir / cfg["output"]["checkpoint_name"], device)
-    denoised = run_denoiser_inference(denoiser, section, cfg, device)
+def run_pipeline(cfg: dict, section: np.ndarray, run_dir: Path, device: str,
+                 blindspot_checkpoint: Path | None = None) -> dict:
+    """Denoise, then segment faults and track horizons on the result.
 
-    out = {"noisy": section, "denoised": denoised}
+    Prefers the blind-spot denoiser when a checkpoint for it is available. It
+    carries its own normalisation constants and runs on the whole section in
+    one pass, so neither the caller's per-section scaling nor the old
+    patch-and-average stitching applies to it.
+    """
+    if blindspot_checkpoint is not None and Path(blindspot_checkpoint).exists():
+        from deepseis.denoise import load_denoiser as load_blindspot
+        from deepseis.denoise import serve_section
+
+        model, noise_model, ckpt = load_blindspot(blindspot_checkpoint, device)
+        denoised = serve_section(model, noise_model, ckpt, section, device)
+        out = {"noisy": section, "denoised": denoised}
+        print(f"[deepseis] denoised with the blind-spot model ({blindspot_checkpoint})")
+    else:
+        denoiser = load_denoiser(cfg, run_dir / cfg["output"]["checkpoint_name"], device)
+        denoised = run_denoiser_inference(denoiser, section, cfg, device)
+        out = {"noisy": section, "denoised": denoised}
 
     faultseg_ckpt = run_dir / cfg["output"]["faultseg_checkpoint_name"]
     if faultseg_ckpt.exists():
@@ -67,6 +83,9 @@ def main() -> None:
     parser.add_argument("--config", type=str, default="configs/default.yaml")
     parser.add_argument("--run-dir", type=str, default=None, help="defaults to output.run_dir from config")
     parser.add_argument("--output", type=str, default=None, help="where to save the .npz result bundle")
+    parser.add_argument("--blindspot", type=str, default="runs/denoise_field/blindspot.pt",
+                        help="blind-spot denoiser checkpoint; used when present, otherwise the "
+                             "legacy masking denoiser from --run-dir is used")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -80,16 +99,25 @@ def main() -> None:
         # transpose to our (n_samples, n_traces) convention.
         section = section[0].T
 
-    # Normalize to unit std — the denoiser is trained on normalized data,
-    # so the input must be on the same scale for inference to be valid.
     section = section.astype(np.float32)
-    input_std = section.std()
-    if input_std > 1e-8:
-        section = section / input_std
-    else:
-        print("[deepseis] warning: input has near-zero std — check your input file.")
+    blindspot = Path(args.blindspot) if args.blindspot else None
+    use_blindspot = blindspot is not None and blindspot.exists()
 
-    result = run_pipeline(cfg, section, run_dir, device)
+    if not use_blindspot:
+        # Legacy path only: the masking denoiser was fitted on unit-std data
+        # and has no record of the scale it was trained at, so the section has
+        # to be normalised here. The blind-spot checkpoint stores its own
+        # global constants and applies them itself -- doing it here as well
+        # would scale the input twice, which is the same class of train/serve
+        # mismatch that cost the old pipeline a factor of 4.4.
+        input_std = section.std()
+        if input_std > 1e-8:
+            section = section / input_std
+        else:
+            print("[deepseis] warning: input has near-zero std — check your input file.")
+
+    result = run_pipeline(cfg, section, run_dir, device,
+                          blindspot_checkpoint=blindspot if use_blindspot else None)
 
     out_path = Path(args.output or (run_dir / "inference_result.npz"))
     out_path.parent.mkdir(parents=True, exist_ok=True)

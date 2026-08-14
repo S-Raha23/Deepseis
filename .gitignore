@@ -11,3 +11,4 @@ data/raw/
 
 # Scratch output from browser-automation QA passes (screenshots + tab dumps)
 .codex_*
+hf_upload/

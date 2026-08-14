@@ -1,12 +1,21 @@
+# CPU-only PyTorch. Without this line, `torch` resolves to the default PyPI
+# wheel, which on Linux drags in the whole CUDA runtime (~2-3 GB of nvidia-*
+# packages). That is useless for an inference-only app on a CPU host and is
+# the usual reason a Streamlit deployment fails: the install either times out
+# or fills the disk. The CPU wheel is ~200 MB.
+--extra-index-url https://download.pytorch.org/whl/cpu
+
 torch>=2.1
 numpy>=1.24
 scipy>=1.10
-scikit-image>=0.21
-segyio>=1.9
-einops>=0.7
+scikit-image>=0.21      # metrics.ssim
+segyio>=1.9             # io/segy.py, SEG-Y read/write
 streamlit>=1.30
 plotly>=5.18
-PyYAML>=6.0
-matplotlib>=3.7
 pandas>=2.0
-huggingface_hub>=0.23
+PyYAML>=6.0
+huggingface_hub>=0.23   # pulls data + checkpoints from SRaha23/Seismic_Data
+
+# matplotlib is used only by notebooks/demo.ipynb, not by the app or the
+# library, so it is not needed to run or deploy DeepSeis:
+#   pip install matplotlib

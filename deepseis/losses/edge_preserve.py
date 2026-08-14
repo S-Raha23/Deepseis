@@ -1,4 +1,18 @@
 """
+SUPERSEDED -- kept only for the legacy masking denoiser in ``train.py``.
+Use ``losses/geology.py`` instead.
+
+This term selects the top 15% of *isotropic Sobel gradient magnitude* and
+defends it. On a post-stack section that set is reflector amplitude --
+near-horizontal, high-contrast bedding -- and almost none of it is fault. A
+fault is not a large gradient; it is a place where lateral **coherence
+breaks**, which Sobel magnitude barely responds to. So despite its name this
+is a reflector-contrast penalty, not a fault-preservation one.
+``geology.fault_contrast_loss`` measures the coherence trough instead, and is
+tested to rise when a fault is smeared out.
+
+--- original description follows ---
+
 Edge / structure-preservation loss — ``lambda_edge * L_edge_preservation``
 in the spec's ``L_total`` (Sec. 3.2), inspired by the DPN2N line of work on
 retaining high-frequency fault information through denoising.

@@ -1,4 +1,19 @@
 """
+SUPERSEDED -- kept only for the legacy masking denoiser in ``train.py``, and
+for ``fk_spectrum``, which the dashboard still uses for display.
+Use ``losses/geology.dip_fan_loss`` instead.
+
+Two problems. It takes an unwindowed ``fft2`` of a 64x64 patch, so much of
+what it measures above its cutoff is the wrap-around discontinuity between
+the patch's opposite edges rather than anything in the data. And it uses a
+*radial* cutoff, which mixes temporal frequency with wavenumber -- physically
+those are not interchangeable, since seismic signal occupies a dip fan through
+the origin and coherent noise is precisely what falls outside that fan at the
+same frequencies. A radial band defends a steeply dipping reflector and white
+noise identically, and cannot express "remove the ground roll, keep the dip".
+
+--- original description follows ---
+
 F-K (frequency-wavenumber) high-frequency preservation loss —
 ``lambda_freq * L_frequency`` in ``L_total`` (spec Sec. 3.2).
 

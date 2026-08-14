@@ -1,0 +1,133 @@
+# Blind-spot denoiser configuration.
+#
+# Two modes matter here and they answer different questions:
+#
+#   data.inject_noise: null   -- field mode. Train self-supervised on the raw
+#                                survey and serve that model. This is the
+#                                product, and it has no ground truth, so only
+#                                no-reference diagnostics are available.
+#
+#   data.inject_noise: {...}  -- validation mode. Add known noise to the real
+#                                sections, train on the contaminated data
+#                                alone, and score against the originals. Real
+#                                geology *and* a reference, which is what makes
+#                                "did it remove geology" answerable at all.
+#
+# Everything else is shared, so a number measured in validation mode
+# characterises the same architecture that field mode ships.
+
+seed: 42
+device: "cpu"
+
+data:
+  volume_path: "data/raw/f3/data/train/train_seismic.npy"
+
+  # Inline blocks are split train / buffer / val / buffer / test. The buffer is
+  # not optional: adjacent F3 inlines correlate at 0.93, so without it the
+  # validation set is a near-copy of the training set. 30 lines brings the
+  # correlation down to ~0.03.
+  split_buffer: 30
+
+  # How many sections to preload for sampling. Crossline sections are
+  # truncated to the training inline range so they cannot carry val/test data.
+  n_inline_sections: 120
+  n_crossline_sections: 60
+
+  patch_size: 128        # bigger than the old 64: a blind-spot model predicts
+                         # a pixel purely from context, so it needs context
+
+  noise_seed: 1234
+  inject_noise:
+    random_std: 0.5      # incoherent noise, relative to each section's std
+    coherent_amp: 0.35   # steeply dipping, low-frequency events outside the
+    n_coherent_events: 3 # geological dip fan -- ground-roll-like contamination
+
+model:
+  base_channels: 32
+  depth: 3
+  n_neighbors: 0         # 0 = single line. >0 stacks adjacent inlines as extra
+                         # channels, which helps only if the noise is
+                         # independent between lines -- an empirical question
+                         # per survey, measured by `python -m deepseis.evaluate`
+  noise_model: "depth"   # "scalar" | "depth" (sigma_n varying with two-way time)
+  init_sigma: 0.3        # only used when estimate_noise is false
+
+  # Measure sigma_n from the data instead of learning it. The training
+  # likelihood constrains only sigma_p^2 + sigma_n^2, so the split between
+  # "context could not predict this" and "this is noise" is close to
+  # unidentifiable -- and that split is exactly what sets how much the
+  # denoiser removes. A partly-trained model here had the total variance right
+  # to within 15% while splitting it almost backwards, which cost 3.1 dB.
+  # The F-K corner estimator recovers the true noise variance to within 1%
+  # on sections with known added noise. See deepseis/noise_estimate.py.
+  estimate_noise: true
+  freeze_noise: true
+
+training:
+  epochs: 30
+  steps_per_epoch: 60
+  batch_size: 8
+  lr: 0.0015
+  noise_lr: 0.01         # the noise model is a handful of parameters and needs
+                         # to move faster than the network to be useful early
+  grad_clip: 1.0
+
+  # OFF by default, on the evidence. Ablated on a matched schedule (identical
+  # seed, steps and LR curve, stopped at the same epoch) and scored on the
+  # held-out test block:
+  #
+  #     structure terms OFF   13.82 dB SNR   0.903 SSIM   faultDice 0.657
+  #     structure terms ON    13.66 dB SNR   0.900 SSIM   faultDice 0.656
+  #
+  # OFF was equal or better at every one of the six matched epochs. The
+  # difference is well inside the +/-0.97 dB spread across sections, so the
+  # honest reading is "no measurable benefit", not "OFF is better" -- and a
+  # term that cannot be shown to help should not be on by default.
+  #
+  # This is not a failure of the terms so much as a sign they are redundant
+  # here: the posterior-mean estimator already keeps the observed amplitude
+  # wherever context cannot predict it, which is what a fault is, so an extra
+  # penalty for the same behaviour has little left to correct. They may still
+  # earn their place on data with strong coherent noise, which is what
+  # dip_fan_loss is shaped for, so the code and its tests are kept.
+  structure_preservation_enabled: false
+  lambda_fault_contrast: 0.5
+  lambda_dip_fan: 0.05
+  max_dip: 1.5           # samples per trace; the widest fan geology occupies
+
+eval:
+  n_sections: 6          # held-out sections scored each epoch
+  # "snr_db" in validation mode, where a reference exists. In field mode use
+  # "nll" -- the predictive likelihood of held-out data, which the blind spot
+  # makes honest because the pixel being scored was never visible to the model
+  # that predicted it. Do NOT select on "leakage" without a reference: it is
+  # minimised by removing nothing, and picking on it selects the least useful
+  # model in the run. Observed directly here -- a field run selecting on
+  # leakage kept its epoch-0 checkpoint (leak 0.213) over every later one.
+  select_on: "snr_db"
+
+postprocess:
+  # Both of these were switched on only after being measured on the held-out
+  # test block, and both are reported as separate rows by evaluate.py so the
+  # decision stays auditable.
+  #
+  #   per_section_sigma  13.79 dB   (+0.13 over the base model)
+  #   orthogonalize      13.72 dB   leakage 0.100 -> 0.059
+  #   base               13.66 dB
+  #
+  # Orthogonalization improves the leakage score it is built to improve, which
+  # on its own would be circular -- what justifies it is that the referenced
+  # SNR improves too, so it is recovering signal rather than reshuffling it.
+  orthogonalize: true
+  ortho_window: 11
+  ortho_iterations: 1
+
+  # Re-measure the noise level from each section instead of using the
+  # survey-wide constant. The true level varies 0.40-0.54 between F3 lines
+  # because noise scales with each section's own amplitude, so one global
+  # value over-denoises the quiet lines and under-denoises the loud ones.
+  per_section_sigma: true
+
+output:
+  run_dir: "runs/denoise"
+  checkpoint_name: "blindspot.pt"
