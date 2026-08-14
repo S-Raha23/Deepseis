@@ -22,6 +22,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from deepseis import metrics as metrics_mod
+from deepseis import viz3d
 from deepseis.interpretation.horizon import track_horizons
 from deepseis.io import noise as noise_mod
 from deepseis.io import segy as segy_mod
@@ -394,8 +395,9 @@ st.sidebar.caption(
 # STARTUP LOADING SCREEN — runs once, shows progress, then renders the dashboard
 # ---------------------------------------------------------------------------
 
-tab_denoise, tab_fault, tab_survey, tab_facies, tab_export, tab_diag = st.tabs([
-    "🧮 Denoise", "🧩 Fault segmentation", "🗺️ F3 Survey explorer",
+(tab_denoise, tab_fault, tab_3d, tab_survey, tab_facies,
+ tab_export, tab_diag) = st.tabs([
+    "🧮 Denoise", "🧩 Fault segmentation", "🧊 3D view", "🗺️ F3 Survey explorer",
     "🌊 Facies", "📤 Export", "🔬 Diagnostics",
 ])
 
@@ -911,7 +913,145 @@ with tab_fault:
 
 
 # ---------------------------------------------------------------------------
-# Tab 3: Survey explorer
+# Tab 3: 3D view
+# ---------------------------------------------------------------------------
+
+@st.cache_data(show_spinner=False)
+def denoised_inline(inline_idx: int, cache_key: tuple = ()):
+    """One denoised inline section, in raw amplitude units."""
+    vol = load_f3_full()
+    return denoise_any(np.asarray(vol[int(inline_idx)], dtype=np.float32).T)
+
+
+@st.cache_data(show_spinner=False)
+def denoised_crossline(crossline_idx: int, cache_key: tuple = ()):
+    """One denoised crossline section.
+
+    Crosslines are in distribution for this denoiser, not an extrapolation:
+    the training sampler draws sections from both orientations.
+    """
+    vol = load_f3_full()
+    return denoise_any(np.asarray(vol[:, int(crossline_idx)], dtype=np.float32).T)
+
+
+with tab_3d:
+    st.subheader("3D view — denoised sections in survey coordinates")
+
+    if not is_real_data:
+        st.info("The 3D view needs the real F3 survey; switch off `data.use_synthetic`.")
+    else:
+        vol3d = load_f3_full()
+        n_il, n_xl, n_t = vol3d.shape
+
+        c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+        il_idx = c1.slider("Inline", 0, n_il - 1, n_il // 2, key="d3_il")
+        xl_idx = c2.slider("Crossline", 0, n_xl - 1, n_xl // 2, key="d3_xl")
+        t_idx = c3.slider("Time slice (sample)", 0, n_t - 1, n_t // 2, key="d3_t")
+        detail = c4.select_slider("Detail", options=["Fast", "Balanced", "Full"],
+                                  value="Balanced", key="d3_detail",
+                                  help="How finely the planes are sampled before being "
+                                       "sent to the browser. Every point becomes JSON, so "
+                                       "'Full' is heavy on a slow connection.")
+        step = {"Fast": 4, "Balanced": 2, "Full": 1}[detail]
+
+        o1, o2, o3 = st.columns([1, 1, 2])
+        show_denoised = o1.toggle("Denoised", value=True, key="d3_den",
+                                  help="Off shows the raw survey, for comparison in place.")
+        show_horizons = o2.toggle("Horizons", value=True, key="d3_hz")
+        show_timeslice = o3.toggle("Show time slice (raw — see note)", value=True, key="d3_ts")
+
+        with st.spinner("Denoising sections and building the scene..."):
+            key = artifact_key(BLINDSPOT_CHECKPOINT)
+            if show_denoised:
+                il_sec = denoised_inline(il_idx, key)
+                xl_sec = denoised_crossline(xl_idx, key)
+            else:
+                il_sec = np.asarray(vol3d[il_idx], dtype=np.float32).T
+                xl_sec = np.asarray(vol3d[:, xl_idx], dtype=np.float32).T
+
+            planes = [viz3d.inline_plane(il_sec, il_idx, step),
+                      viz3d.crossline_plane(xl_sec, xl_idx, step)]
+            if show_timeslice:
+                planes.append(viz3d.timeslice_plane(
+                    np.asarray(vol3d[:, :, t_idx], dtype=np.float32), t_idx, step + 1))
+
+            cmin, cmax = viz3d.symmetric_limits(il_sec, xl_sec)
+
+            fig3d = go.Figure()
+            for plane in planes:
+                fig3d.add_trace(go.Surface(
+                    x=plane.x, y=plane.y, z=plane.z, surfacecolor=plane.color,
+                    colorscale=SEISMIC_COLORSCALE, cmin=cmin, cmax=cmax,
+                    showscale=False, opacity=1.0,
+                    lighting=dict(ambient=0.95, diffuse=0.2, specular=0.05),
+                    contours=dict(x=dict(highlight=False), y=dict(highlight=False),
+                                  z=dict(highlight=False)),
+                ))
+
+            if show_horizons:
+                fault_mask = None
+                if faultseg is not None:
+                    std = float(il_sec.std()) or 1.0
+                    prob = run_faultseg_inference(faultseg, (il_sec / std).astype(np.float32),
+                                                  cfg, device)
+                    fault_mask = prob >= dice_threshold
+                tracks = track_horizons(il_sec, cfg["horizon"]["n_horizons"],
+                                        fault_mask=fault_mask)
+                for k, (hx, hy, hz) in enumerate(viz3d.horizon_polylines(tracks, il_idx, step)):
+                    fig3d.add_trace(go.Scatter3d(
+                        x=hx, y=hy, z=hz, mode="lines",
+                        line=dict(width=5, color=FACIES_COLORS[k % len(FACIES_COLORS)]),
+                        name=f"Horizon {k + 1}", hoverinfo="name"))
+
+            aspect = viz3d.scene_aspect(n_xl, n_il, n_t)
+            axis_style = dict(showbackground=True, backgroundcolor="rgb(12,14,20)",
+                              gridcolor="rgba(120,130,150,0.25)", zerolinecolor="rgba(120,130,150,0.4)",
+                              color="rgb(200,205,215)")
+            fig3d.update_layout(
+                height=680, margin=dict(l=0, r=0, t=10, b=0),
+                paper_bgcolor="rgb(12,14,20)",
+                scene=dict(
+                    xaxis=dict(title="Crossline", **axis_style),
+                    yaxis=dict(title="Inline", **axis_style),
+                    zaxis=dict(title="Sample (two-way time →)", **axis_style),
+                    aspectmode="manual",
+                    aspectratio=dict(x=aspect["x"], y=aspect["y"], z=aspect["z"]),
+                    camera=dict(eye=dict(x=1.6, y=-1.5, z=0.9)),
+                ),
+                showlegend=show_horizons,
+                legend=dict(font=dict(color="rgb(200,205,215)"), bgcolor="rgba(0,0,0,0)"),
+            )
+            st.plotly_chart(fig3d, width='stretch', key="d3_scene")
+
+        st.caption(
+            "Drag to rotate, scroll to zoom. The vertical axis is exaggerated "
+            f"{viz3d.scene_aspect(n_xl, n_il, n_t)['z'] / max(n_t / max(n_xl, n_il), 1e-9):.1f}x — "
+            "a true-scale seismic cube is a thin sheet with no visible structure, so "
+            "interpretation software exaggerates it as a matter of course."
+        )
+
+        if show_timeslice:
+            st.warning(
+                "**The time slice is raw data, and deliberately so.** A time slice is an "
+                "inline × crossline plane at fixed two-way time — a different geometry from "
+                "the time × trace sections this denoiser was trained on. Running the model "
+                "on one would return something that looks plausible and means nothing. "
+                "Producing a genuinely denoised time slice needs every inline denoised "
+                "first, which is about 8 minutes of CPU here, so it belongs in a "
+                "precomputed volume rather than a live view. The two vertical planes are "
+                f"{'denoised' if show_denoised else 'raw'}."
+            )
+
+        st.caption(
+            "Horizons are tracked on the displayed inline and drawn where the tracker "
+            "actually followed a reflector — a break in a line is a pick that was lost, "
+            "usually across a fault, not a rendering gap. Faults are used to widen the "
+            "tracker's search window rather than being drawn directly."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tab 4: Survey explorer
 # ---------------------------------------------------------------------------
 
 with tab_survey:

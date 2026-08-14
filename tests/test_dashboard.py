@@ -222,3 +222,35 @@ def test_data_is_loaded_from_the_hugging_face_dataset_when_absent_locally():
     # and a local copy must still take precedence, so a dev machine does not
     # re-download hundreds of MB on every run
     assert "local_candidates" in source and "Path(candidate).exists()" in source,         "the resolver no longer prefers a local copy over the download"
+
+
+@needs_data
+def test_3d_tab_renders_a_scene(app):
+    headings = " | ".join(str(s.value) for s in app.get("subheader"))
+    assert "3D view" in headings, "the 3D tab produced no content"
+
+
+@needs_data
+def test_3d_scene_is_wired_to_the_geometry_module(app):
+    """The scene must be built from `viz3d`, whose placement is tested directly
+    in tests/test_viz3d.py, and must carry both vertical planes plus horizons.
+
+    Asserted against the source rather than the rendered figure: AppTest cannot
+    read `.value` off a plotly_chart that was given an explicit key without
+    tripping a session-state lookup.
+    """
+    source = APP.read_text(encoding="utf-8")
+    assert "viz3d.inline_plane" in source and "viz3d.crossline_plane" in source,         "the 3D scene no longer builds its planes from the tested geometry module"
+    assert "go.Surface(" in source, "no surface trace in the scene"
+    assert "viz3d.horizon_polylines" in source, "horizons are not drawn"
+    assert "viz3d.symmetric_limits" in source,         "colour limits are not symmetric, so seismic polarity will read wrong"
+    assert "aspectmode=\"manual\"" in source, "the cube is not given an explicit aspect ratio"
+
+
+@needs_data
+def test_3d_tab_states_that_the_time_slice_is_not_denoised(app):
+    """A time slice has a different geometry from anything the denoiser was
+    trained on. Showing it silently alongside denoised planes would imply it
+    had been denoised too."""
+    warnings = " ".join(str(w.value) for w in app.get("warning"))
+    assert "time slice is raw data" in warnings.lower() or "raw data, and deliberately so" in warnings
