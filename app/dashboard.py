@@ -934,10 +934,31 @@ def denoised_crossline(crossline_idx: int, cache_key: tuple = ()):
     return denoise_any(np.asarray(vol[:, int(crossline_idx)], dtype=np.float32).T)
 
 
+#: Helpers this tab needs from `deepseis.viz3d`. Checked rather than assumed,
+#: because Streamlit re-executes this script on every rerun while imported
+#: modules stay in `sys.modules`. A deploy that changes both this file and
+#: `viz3d.py` can therefore leave a *new* dashboard calling an *old* module,
+#: which surfaces as a bare AttributeError with the message redacted -- and on
+#: Streamlit Cloud the redaction means the reason is invisible. Naming the
+#: missing helper and the fix is worth six lines.
+_VIZ3D_REQUIRED = ("inline_plane", "crossline_plane", "timeslice_plane",
+                   "horizon_polylines", "symmetric_limits", "scene_aspect",
+                   "offset_plane", "apply_notch", "shell_offsets")
+
 with tab_3d:
     st.subheader("3D view — the survey as a block")
 
-    if not is_real_data:
+    _missing = [n for n in _VIZ3D_REQUIRED if not hasattr(viz3d, n)]
+    if _missing:
+        st.error(
+            "**The app is running a stale copy of `deepseis.viz3d`.** "
+            f"Missing: `{'`, `{'.join(_missing)}`.\n\n"
+            "This happens when a deploy updates `app/dashboard.py` but the already-imported "
+            "`deepseis` package stays cached in `sys.modules`. The code is fine; the process "
+            "is holding two different versions.\n\n"
+            "**Fix:** *Manage app* → **⋮** → **Reboot app**."
+        )
+    elif not is_real_data:
         st.info("The 3D view needs the real F3 survey; switch off `data.use_synthetic`.")
     else:
         vol3d = load_f3_full()

@@ -282,3 +282,35 @@ def test_separation_is_a_translation_not_a_recompute(app):
     sep_block = source[source.index('key="d3_sep"'):source.index("st.plotly_chart(fig3d")]
     assert "offset_plane" in sep_block
     assert "denoised_inline(separation" not in sep_block
+
+
+@needs_data
+def test_3d_tab_detects_a_stale_viz3d_module(app):
+    """Streamlit keeps imported modules in sys.modules across reruns, so a
+    deploy can leave a new dashboard calling an old `viz3d`. On Streamlit Cloud
+    the resulting AttributeError has its message redacted, so the cause is
+    invisible unless the app names it."""
+    source = APP.read_text(encoding="utf-8")
+    assert "_VIZ3D_REQUIRED" in source, "no staleness guard on the 3D tab"
+    assert "Reboot app" in source, "the guard does not tell the user how to fix it"
+
+    # every helper the tab calls must be listed in the guard, or the guard
+    # gives false confidence
+    import re
+    called = set(re.findall(r"viz3d\.(\w+)\(", source))
+    guard = set(re.findall(r'"(\w+)"', source[source.index("_VIZ3D_REQUIRED"):
+                                              source.index("with tab_3d:")]))
+    assert called <= guard, f"viz3d helpers used but not guarded: {sorted(called - guard)}"
+
+
+def test_viz3d_exposes_everything_the_dashboard_guards_for():
+    """The guard list must not drift away from the module it guards."""
+    import re
+
+    from deepseis import viz3d as _v
+
+    source = APP.read_text(encoding="utf-8")
+    guard = re.findall(r'"(\w+)"', source[source.index("_VIZ3D_REQUIRED"):
+                                          source.index("with tab_3d:")])
+    for name in guard:
+        assert hasattr(_v, name), f"guard names {name!r}, which viz3d does not define"
