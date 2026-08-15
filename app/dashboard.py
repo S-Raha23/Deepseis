@@ -28,7 +28,6 @@ from deepseis.io import noise as noise_mod
 from deepseis.io import segy as segy_mod
 from deepseis.io import synthetic as synth_mod
 from deepseis.losses.frequency import fk_spectrum
-from deepseis.masking.jacobian_explain import compute_pixel_jacobian, suggest_mask_design
 from deepseis.models.facies import FaciesNet2D
 from deepseis.models.faultseg import FaultSegNet2D
 from deepseis.models.unet import DenoiserUNet
@@ -1362,62 +1361,181 @@ with tab_export:
 # Tab 6: Diagnostics
 # ---------------------------------------------------------------------------
 
+#: Fallbacks for the controlled section, used when the Denoise tab's sliders
+#: were never created -- that happens on the legacy-denoiser path, which builds
+#: a different set of widgets. They match the slider defaults so both tabs show
+#: the same section until the user moves one.
+DIAG_DEFAULTS = {"demo_inline": 390, "demo_std": 0.5, "demo_coh": 0.35}
+
 with tab_diag:
     st.subheader("Diagnostics")
 
-    st.markdown("#### F-K spectrum — signal survives denoising")
+    # Every panel in this tab is a *comparison* between what went in and what
+    # came out. On raw F3 that comparison is close to empty, because the survey
+    # is commercially processed and the field-mode denoiser correctly removes
+    # under 1% of its variance -- which leaves a viewer unable to tell "working,
+    # nothing to remove" apart from "not working at all". The controlled section
+    # carries a known amount of noise, so the same three diagnostics have
+    # something to display: the F-K haze visibly clears, the leakage map has
+    # something to be near-zero *about*, and the numbers are the ones
+    # `deepseis.evaluate` reports on the held-out block.
+    diag_source = st.radio(
+        "Section to diagnose",
+        ["Controlled experiment — known noise added", "Raw F3 — what the app serves"],
+        index=0, horizontal=True, key="diag_source",
+        help="Raw F3 is already commercially processed, so there is very little "
+             "incoherent noise left to remove and every panel below correctly "
+             "shows almost no change. The controlled section adds a known amount "
+             "of noise to a held-out inline, so the diagnostics have something to "
+             "measure and can be checked against a reference.",
+    )
+
+    diag_clean = None
+    if diag_source.startswith("Controlled"):
+        d_inline = int(st.session_state.get("demo_inline", DIAG_DEFAULTS["demo_inline"]))
+        d_std = float(st.session_state.get("demo_std", DIAG_DEFAULTS["demo_std"]))
+        d_coh = float(st.session_state.get("demo_coh", DIAG_DEFAULTS["demo_coh"]))
+        diag_demo = make_controlled_demo(d_inline, d_std, d_coh,
+                                         artifact_key("runs/denoise/blindspot.pt"))
+        if diag_demo is None:
+            st.warning(
+                "The benchmark denoiser is not trained yet, so the controlled section is "
+                "unavailable — falling back to raw F3. Train it with "
+                "`python -m deepseis.denoise --config configs/denoise.yaml`."
+            )
+            diag_input, diag_denoised = noisy, denoised_primary
+        else:
+            diag_clean, diag_input, diag_denoised, _ = diag_demo
+            st.caption(
+                f"Diagnosing **held-out inline {d_inline}**, with {d_std:.1f} random and "
+                f"{d_coh:.2f} coherent noise added. The level is set by the sliders in the "
+                "Denoise tab, so both tabs always show the same section. Inlines 373–400 are "
+                "the test block, separated from training by two 30-line buffers."
+            )
+    else:
+        diag_input, diag_denoised = noisy, denoised_primary
+        st.info(
+            "**Raw F3 barely changes, and that is the correct result.** This volume is "
+            "migrated, stacked, commercially processed seismic whose measured incoherent "
+            "noise level is very low, so a calibrated denoiser removes about 0.1% of its "
+            "variance. Every panel below will therefore look almost unchanged. A model that "
+            "visibly altered this section would be removing geology. Switch to the "
+            "controlled experiment to see the same diagnostics on data with known noise in it."
+        )
+
+    # The same honest pairing the Denoise tab uses: leakage is minimised by
+    # removing nothing, so it is never shown without the energy-removed figure
+    # that makes it readable.
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("Signal leakage", f"{metrics_mod.leakage_score(diag_input, diag_denoised):.3f}",
+              help="Mean local correlation between what was removed and what was kept. "
+                   "Lower is better — but an identity filter scores a perfect 0.000, so "
+                   "read it next to 'energy removed'.")
+    d2.metric("Energy removed",
+              f"{metrics_mod.energy_removed_fraction(diag_input, diag_denoised):.1%}",
+              help="Fraction of the input variance that ended up in the difference section.")
+    d3.metric("Residual coherence",
+              f"{metrics_mod.residual_coherence(diag_input, diag_denoised):.3f}",
+              help="Semblance of the removed section. Random noise is incoherent, so a "
+                   "clean removal scores low; organised structure in the residual means "
+                   "geology was taken out.")
+    if diag_clean is not None:
+        snr_out = metrics_mod.snr_db(diag_denoised, diag_clean)
+        snr_in = metrics_mod.snr_db(diag_input, diag_clean)
+        d4.metric("SNR vs the original", f"{snr_out:.2f} dB", f"{snr_out - snr_in:+.2f} dB",
+                  help=f"Available only here, because the controlled section has a known "
+                       f"clean reference — the input was {snr_in:.2f} dB. Unlike leakage, "
+                       f"this cannot be improved by removing less.")
+    else:
+        d4.metric("Output / input std",
+                  f"{diag_denoised.std() / (diag_input.std() + 1e-12):.3f}",
+                  help="A denoiser should sit slightly below 1.0. Above 1.0 means it is "
+                       "adding energy, which the previous model did (1.247).")
+
+    st.divider()
+    st.markdown("#### F-K spectrum — which kinds of stripes the section is made of")
     with st.spinner("Computing F-K spectra..."):
-        fk_noisy    = fk_spectrum(torch.from_numpy(noisy)).numpy()
-        fk_denoised = fk_spectrum(torch.from_numpy(denoised_primary)).numpy()
+        fk_noisy    = fk_spectrum(torch.from_numpy(np.ascontiguousarray(diag_input))).numpy()
+        fk_denoised = fk_spectrum(torch.from_numpy(np.ascontiguousarray(diag_denoised))).numpy()
+
+    # One colour scale across both panels. Letting each auto-scale to its own
+    # range is what makes a before/after pair unreadable: a genuine loss of
+    # energy is normalised away, and an unchanged spectrum can be made to look
+    # different. The comparison is the whole point of showing two of them.
+    fk_lo = float(min(fk_noisy.min(), fk_denoised.min()))
+    fk_hi = float(max(fk_noisy.max(), fk_denoised.max()))
+
+    def _fk_figure(spectrum: np.ndarray, title: str) -> go.Figure:
+        fig = go.Figure(go.Heatmap(z=spectrum, colorscale="Viridis",
+                                   zmin=fk_lo, zmax=fk_hi, showscale=False))
+        fig.update_xaxes(title="Wavenumber k  (dip) — zero at centre")
+        fig.update_yaxes(title="Temporal frequency f — zero at centre")
+        fig.update_layout(title=title, height=350, margin=dict(l=10, r=10, t=40, b=10))
+        return fig
+
     cols = st.columns(2)
     with cols[0]:
-        st.plotly_chart(go.Figure(go.Heatmap(z=fk_noisy, colorscale="Viridis"))
-                        .update_layout(title="F-K — raw", height=350, margin=dict(l=10,r=10,t=40,b=10)),
+        st.plotly_chart(_fk_figure(fk_noisy, "F-K — input"),
                         width='stretch', key="diag_fk_noisy")
     with cols[1]:
-        st.plotly_chart(go.Figure(go.Heatmap(z=fk_denoised, colorscale="Viridis"))
-                        .update_layout(title="F-K — denoised", height=350, margin=dict(l=10,r=10,t=40,b=10)),
+        st.plotly_chart(_fk_figure(fk_denoised, "F-K — denoised"),
                         width='stretch', key="diag_fk_denoised")
 
-    st.markdown("#### Signal-leakage map — no geology removed")
-    st.caption("Values near zero = removed component is noise, not geology.")
-    with st.spinner("Computing local similarity map..."):
-        sim_map = metrics_mod.local_similarity_map_fast(noisy, denoised_primary, window=9)
-    st.plotly_chart(go.Figure(go.Heatmap(z=sim_map, colorscale="RdBu", zmid=0, zmin=-1, zmax=1))
-                    .update_layout(title="Local correlation: (noisy − denoised) vs. denoised", height=380,
-                                   yaxis=dict(autorange="reversed"), margin=dict(l=10,r=10,t=40,b=10)),
-                    width='stretch', key="diag_sim_map")
-
-    st.markdown("#### Jacobian sensitivity (legacy masking denoiser)")
     st.caption(
-        "Pick a pixel and see which inputs the **legacy masking** denoiser relies on. "
-        "The mask-shape recommendation below applies only to that model: the current "
-        "denoiser has no mask to design, because its blind spot comes from the "
-        "architecture rather than from corrupting the input. Its equivalent sensitivity "
-        "map is exactly zero at the chosen pixel by construction, which "
-        "`tests/test_blindspot.py` asserts for every pixel."
+        "An event dipping `p` samples per trace maps to the line `k = p·f`, so **all the "
+        "geology together fills a bow-tie through the centre** — flat reflectors on the "
+        "vertical axis, steeper dips fanning outwards. Incoherent noise is white, so it "
+        "spreads evenly over the *whole* plane including the corners the bow-tie never "
+        "reaches. **A good denoiser empties the outside and leaves the bow-tie the same "
+        "shape and size; over-smoothing eats the bow-tie from its edges inwards.** Both "
+        "panels share one colour scale, so they can be compared directly."
     )
-    jy = st.slider("Row (sample)",  10, noisy.shape[0]-10, noisy.shape[0]//2, key="jy")
-    jx = st.slider("Col (trace)",   10, noisy.shape[1]-10, noisy.shape[1]//2, key="jx")
-    if st.button("Compute Jacobian"):
-        pcfg = cfg["data"]["patch"]
-        half = pcfg["size"] // 2
-        y0 = min(max(0, jy-half), noisy.shape[0]-pcfg["size"])
-        x0 = min(max(0, jx-half), noisy.shape[1]-pcfg["size"])
-        patch = noisy[y0:y0+pcfg["size"], x0:x0+pcfg["size"]]
-        x_t = torch.from_numpy(patch.astype(np.float32)).unsqueeze(0).unsqueeze(0).to(device)
-        with st.spinner("Computing Jacobian..."):
-            jac        = compute_pixel_jacobian(model_on, x_t, (jy-y0, jx-x0))
-            suggestion = suggest_mask_design(jac, (jy-y0, jx-x0))
-        c1, c2 = st.columns(2)
-        with c1:
-            st.plotly_chart(go.Figure(go.Heatmap(z=jac, colorscale="Inferno"))
-                            .update_layout(title="Sensitivity |d(output)/d(input)|", height=350,
-                                           margin=dict(l=10,r=10,t=40,b=10)),
-                            width='stretch', key="diag_jacobian")
-        with c2:
-            st.write(f"**Suggested blind shape:** `{suggestion.suggested_blind_shape}`")
-            st.write(f"**Suggested blind width:** `{suggestion.suggested_blind_width}` px")
-            st.write(f"Lateral extent: {suggestion.lateral_extent_px:.1f} px")
-            st.write(f"Vertical extent: {suggestion.vertical_extent_px:.1f} px")
-            st.caption("If measured extent > `masking.struct_n2v.blind_width` in config, widen the mask.")
+
+    st.markdown("#### Energy kept in each F-K band")
+    retention = metrics_mod.spectral_retention(diag_input, diag_denoised)
+    bands = list(retention.keys())
+    ret_fig = go.Figure(go.Bar(x=bands, y=[retention[b] for b in bands],
+                               marker_color="#4d9de0",
+                               hovertemplate="%{x} of Nyquist: %{y:.3f} kept<extra></extra>"))
+    ret_fig.add_hline(y=1.0, line_dash="dash", line_color="#888",
+                      annotation_text="untouched", annotation_position="top left")
+    ret_fig.update_yaxes(title="fraction of input energy kept", range=[0, 1.15])
+    ret_fig.update_xaxes(title="radial F-K band (fraction of Nyquist)")
+    ret_fig.update_layout(height=300, margin=dict(l=10, r=10, t=20, b=10))
+    st.plotly_chart(ret_fig, width='stretch', key="diag_retention")
+    st.caption(
+        "The signature of over-smoothing is a monotone collapse towards the high bands "
+        "while the low bands stay untouched — that is a low-pass filter's fingerprint. "
+        "**On F3 the high bands are emptied, and the reason matters:** this survey is "
+        "band-limited by its own processing chain, with power falling off a cliff past "
+        "0.4 Nyquist, so the band being emptied holds the added noise and essentially "
+        "nothing else. The same profile on data whose *signal* reached those frequencies "
+        "would be a problem, and would show up here."
+    )
+
+    st.divider()
+    st.markdown("#### Signal-leakage map — where, if anywhere, geology was removed")
+    with st.spinner("Computing local similarity map..."):
+        sim_map = metrics_mod.local_similarity_map_fast(diag_input, diag_denoised, window=9)
+    st.plotly_chart(go.Figure(go.Heatmap(z=sim_map, colorscale="RdBu", zmid=0, zmin=-1, zmax=1))
+                    .update_layout(title="Local correlation: (input − denoised) vs. denoised",
+                                   height=380, yaxis=dict(autorange="reversed", title="Sample (depth)"),
+                                   xaxis=dict(title="Trace"), margin=dict(l=10,r=10,t=40,b=10)),
+                    width='stretch', key="diag_sim_map")
+    st.caption(
+        "In every 9×9 window this asks: **does what we removed look like what we kept?** "
+        "True noise is independent of the signal, so **white (near zero) is the good "
+        "answer**. Red or blue marks a place where the removed component is a scaled copy "
+        "of the output — signal that leaked into the discard — and the map gives its "
+        "address, so it can be checked against the section itself. The single leakage "
+        "number above is the mean of this map's absolute value: this panel says *where*, "
+        "the number says *how much*."
+    )
+
+    # The Jacobian sensitivity panel that used to sit here probed the *legacy*
+    # masking denoiser, asking whether its blind spot was genuinely blind. That
+    # question is now settled by construction rather than by inspection, and
+    # `tests/test_blindspot.py` asserts it at every pixel of a test section
+    # instead of at one pixel a viewer happens to click. Keeping an interactive
+    # panel for a superseded model only invited the question "which model am I
+    # looking at?" in the middle of a diagnostics tab about the current one.

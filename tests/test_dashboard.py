@@ -225,6 +225,63 @@ def test_data_is_loaded_from_the_hugging_face_dataset_when_absent_locally():
 
 
 @needs_data
+def test_diagnostics_defaults_to_the_controlled_section(app):
+    """Every panel on that tab is a comparison between input and output, and on
+    raw F3 that comparison is correctly almost empty -- the survey is already
+    commercially processed, so the denoiser removes under 1% of its variance.
+    Defaulting the tab there makes a working diagnostic indistinguishable from a
+    broken one, which is the opposite of what a diagnostic is for.
+    """
+    labelled = [r for r in app.get("radio") if "Section to diagnose" in str(r.label)]
+    assert labelled, "the diagnostics tab has no section selector"
+    assert str(labelled[0].value).startswith("Controlled"), (
+        f"diagnostics defaults to {labelled[0].value!r}; it must default to the section "
+        f"that has known noise in it, or the panels show nothing and look broken"
+    )
+    options = " | ".join(str(o) for o in labelled[0].options)
+    assert "Raw F3" in options, "the raw-survey view is no longer reachable"
+
+
+@needs_data
+def test_diagnostics_fk_panels_share_one_colour_scale(app):
+    """Two heatmaps that each auto-scale to their own range cannot be compared.
+
+    A genuine loss of energy is normalised away and an unchanged spectrum can be
+    made to look different, which defeats the only reason to show a before and
+    an after side by side.
+    """
+    source = APP.read_text(encoding="utf-8")
+    assert "min(fk_noisy.min(), fk_denoised.min())" in source, \
+        "the F-K colour floor is not computed across both panels"
+    assert "max(fk_noisy.max(), fk_denoised.max())" in source, \
+        "the F-K colour ceiling is not computed across both panels"
+    assert source.count("zmin=fk_lo, zmax=fk_hi") >= 1, \
+        "the shared F-K limits are computed but not applied"
+
+
+@needs_data
+def test_leakage_is_never_shown_without_energy_removed(app):
+    """The pairing rule, enforced wherever leakage appears rather than on one tab.
+
+    A filter that removes nothing scores a perfect 0.000 leakage, so the number
+    is unreadable alone -- that is most of how this project's previous headline
+    figure was earned.
+    """
+    labels = [m.label for m in app.get("metric")]
+    leaks = labels.count("Signal leakage")
+    removed = labels.count("Energy removed")
+
+    # One-directional: energy-removed may stand alone (the controlled demo
+    # reports it beside SNR, which is already un-gameable), but leakage may not.
+    assert removed >= leaks, (
+        f"leakage shown {leaks}x against only {removed}x energy-removed; every leakage "
+        f"figure needs the partner that makes it readable"
+    )
+    assert leaks >= 2, \
+        "the diagnostics tab no longer reports the no-reference metric set"
+
+
+@needs_data
 def test_3d_tab_renders_a_scene(app):
     headings = " | ".join(str(s.value) for s in app.get("subheader"))
     assert "3D view" in headings, "the 3D tab produced no content"

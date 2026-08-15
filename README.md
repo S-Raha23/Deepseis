@@ -319,7 +319,7 @@ there is not much for the network to learn beyond the geology it is already bein
 | 🗺️ **F3 Survey explorer** | Inline slider — scrub through all 401 real F3 inlines live |
 | 🌊 **Facies** | **Held-out** IoU per unit up front, then the in-sample map vs. published labels and error map — labelled as in-sample |
 | 📤 **Export** | Download denoised section as SEG-Y or .npy |
-| 🔬 **Diagnostics** | F-K spectrum, signal-leakage map, Jacobian sensitivity (legacy model) |
+| 🔬 **Diagnostics** | Selectable section (controlled experiment or raw F3), the no-reference metric set, F-K spectra before/after on a shared colour scale, energy kept per F-K band, and the signal-leakage map |
 
 The Denoise tab is deliberately blunt about the fact that raw F3 barely changes: the app says
 so in place, and puts the controlled experiment directly underneath so the capability can be
@@ -352,8 +352,11 @@ rather than typed in, so the app cannot quietly disagree with this README.
 - [x] Physics-guided diffusion refiner (DDPM, Laplacian-smoothness prior)
 - [x] Horizon tracking (amplitude-peak auto-tracking, fault-aware)
 - [x] F-K spectrum viewer (before/after denoising)
-- [x] Jacobian sensitivity map — applies to the legacy masking denoiser only; the current
-      model's sensitivity to its own pixel is exactly zero by construction
+- [x] Jacobian sensitivity map (`masking/jacobian_explain.py`) — built to audit the *legacy*
+      masking denoiser's blind spot. Removed from the dashboard: the current model's
+      sensitivity to its own pixel is exactly zero by construction, and
+      `tests/test_blindspot.py` asserts that at every pixel rather than at one the viewer
+      happens to click
 
 The masking denoiser (`models/unet.py`, `masking/`) is retained so the previous model can be
 loaded and scored beside the current one, which `deepseis.evaluate --legacy` does.
