@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DeepSeis Demo</title>
+<meta name="description" content="Fault-preserving self-supervised seismic denoising and automated interpretation on the real F3 Netherlands survey.">
+<style>
+  :root {
+    --bg: #f6f7f9; --surface: #ffffff; --text: #16191d; --muted: #5b6470;
+    --line: #dde1e6; --accent: #1f5fae; --accent-soft: #e6eef8; --good: #1b7a46;
+    --ours: #fff7e0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1216; --surface: #171b21; --text: #e7eaee; --muted: #9aa4b0;
+      --line: #2a3038; --accent: #7fb0ec; --accent-soft: #1d2b3d; --good: #5fd08f;
+      --ours: #2d2715;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f1216; --surface: #171b21; --text: #e7eaee; --muted: #9aa4b0;
+    --line: #2a3038; --accent: #7fb0ec; --accent-soft: #1d2b3d; --good: #5fd08f;
+    --ours: #2d2715;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+  main { max-width: 1120px; margin: 0 auto; padding: 0 16px 48px; }
+  a { color: var(--accent); }
+  header { padding: 40px 0 8px; }
+  .eyebrow { color: var(--muted); font-size: 13px; letter-spacing: .02em; margin: 0 0 8px; }
+  h1 { font-size: clamp(30px, 5vw, 44px); line-height: 1.1; margin: 0 0 12px; letter-spacing: -.01em; }
+  .lede { font-size: 18px; color: var(--muted); max-width: 760px; margin: 0 0 16px; }
+  .links { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 8px; }
+  .links a {
+    text-decoration: none; border: 1px solid var(--line); background: var(--surface);
+    padding: 6px 12px; border-radius: 8px; font-size: 14px;
+  }
+  .links a:hover { border-color: var(--accent); }
+
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 28px 0 8px; }
+  .stat { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
+  .stat .label { font-size: 13px; color: var(--muted); }
+  .stat .value { font-size: 28px; font-weight: 650; font-variant-numeric: tabular-nums; margin: 2px 0; }
+  .stat .sub { font-size: 13px; color: var(--muted); }
+  .stat .up { color: var(--good); font-weight: 600; }
+
+  section { margin-top: 44px; }
+  h2 { font-size: 24px; margin: 0 0 8px; }
+  h3 { font-size: 15px; margin: 0 0 6px; font-weight: 600; }
+  .intro { color: var(--muted); max-width: 780px; margin: 0 0 16px; }
+
+  .picker { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 0 0 14px; }
+  .picker .label { font-size: 14px; color: var(--muted); margin-right: 4px; }
+  .picker button {
+    font: inherit; font-size: 14px; font-variant-numeric: tabular-nums; cursor: pointer;
+    border: 1px solid var(--line); background: var(--surface); color: var(--text);
+    padding: 5px 11px; border-radius: 999px;
+  }
+  .picker button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+  :root[data-theme="dark"] .picker button[aria-pressed="true"] { color: #0f1216; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) .picker button[aria-pressed="true"] { color: #0f1216; }
+  }
+
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
+  .panel img, .wipe img {
+    display: block; width: 100%; height: auto; aspect-ratio: 701 / 255;
+    border-radius: 6px; background: var(--line);
+  }
+  .grid { display: grid; gap: 12px; margin-top: 12px; }
+  .g2 { grid-template-columns: repeat(2, 1fr); }
+  .g3 { grid-template-columns: repeat(3, 1fr); }
+  .caption { font-size: 13px; color: var(--muted); margin: 6px 0 0; }
+
+  .wipe { position: relative; user-select: none; touch-action: pan-y; }
+  .wipe .top { position: absolute; inset: 0; clip-path: inset(0 50% 0 0); }
+  .wipe .top img { height: 100%; }
+  .wipe input {
+    position: absolute; inset: 0; width: 100%; height: 100%; margin: 0;
+    opacity: 0; cursor: ew-resize;
+  }
+  .wipe .handle {
+    position: absolute; top: 0; bottom: 0; left: 50%; width: 2px; margin-left: -1px;
+    background: #fff; box-shadow: 0 0 0 1px rgba(0,0,0,.35); pointer-events: none;
+  }
+  .wipe .handle::after {
+    content: "\2194"; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    width: 30px; height: 30px; border-radius: 50%; background: #fff; color: #222;
+    display: grid; place-items: center; font-size: 16px; box-shadow: 0 1px 4px rgba(0,0,0,.4);
+  }
+  .wipe input:focus-visible ~ .handle::after { outline: 3px solid var(--accent); outline-offset: 2px; }
+  .tag {
+    position: absolute; top: 8px; font-size: 12px; font-weight: 600; pointer-events: none;
+    background: rgba(0,0,0,.6); color: #fff; padding: 3px 8px; border-radius: 6px;
+  }
+  .tag.l { left: 8px; } .tag.r { right: 8px; }
+
+  .metrics { display: flex; flex-wrap: wrap; gap: 6px 20px; margin: 12px 2px 0; font-size: 14px; }
+  .metrics b { font-variant-numeric: tabular-nums; }
+  .metrics .arrow { color: var(--muted); }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 16px; margin: 12px 2px 0; font-size: 13px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .legend i { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+  .legend em { font-style: normal; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+  .table-wrap { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; min-width: 560px; }
+  th, td { padding: 9px 12px; text-align: right; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  th { font-weight: 600; color: var(--muted); font-size: 13px; }
+  td { font-variant-numeric: tabular-nums; }
+  tr:last-child td { border-bottom: none; }
+  tr.ours td { background: var(--ours); font-weight: 600; }
+
+  footer { margin-top: 48px; padding-top: 20px; border-top: 1px solid var(--line); color: var(--muted); font-size: 14px; }
+  footer p { margin: 0 0 8px; max-width: 820px; }
+  code { font-size: 13px; background: var(--accent-soft); padding: 1px 5px; border-radius: 4px; }
+
+  @media (max-width: 860px) {
+    .stats { grid-template-columns: repeat(2, 1fr); }
+    .g3 { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 560px) {
+    .g2 { grid-template-columns: 1fr; }
+    .stat .value { font-size: 24px; }
+    header { padding-top: 28px; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <p class="eyebrow">MC²Plus · Oil India Ltd. · IIT Kharagpur Energy Innovation Challenge 2026 · Track 1</p>
+    <h1>DeepSeis</h1>
+    <p class="lede">Self-supervised seismic denoising that keeps the faults, followed by automated
+      fault and facies interpretation. It is trained on the real F3 Netherlands survey and never
+      needs a clean training example.</p>
+    <nav class="links">
+      <a href="https://github.com/S-Raha23/Deepseis">Source code</a>
+      <a href="https://huggingface.co/datasets/SRaha23/Seismic_Data">Data &amp; checkpoints</a>
+    </nav>
+    <div class="stats" id="stats"></div>
+  </header>
+
+  <section id="controlled">
+    <h2>Denoising, checked against the answer</h2>
+    <p class="intro">The published F3 volume is already commercially processed and carries
+      very little noise, so on raw data a well-calibrated denoiser should change almost nothing.
+      To show what it does, known noise is added to held-out inlines the model never trained on,
+      and the output is scored against the original. These are all the inlines in the benchmark.</p>
+    <div class="picker" id="pick-controlled" role="group" aria-label="Held-out inline"></div>
+    <div class="card">
+      <div class="wipe" id="wipe">
+        <img id="c-denoised" alt="Denoised section" width="701" height="255">
+        <div class="top"><img id="c-noisy" alt="Section with added noise" width="701" height="255"></div>
+        <span class="tag l">With added noise</span>
+        <span class="tag r">DeepSeis denoised</span>
+        <input type="range" min="0" max="100" value="50" step="0.5" aria-label="Compare noisy and denoised">
+        <div class="handle"></div>
+      </div>
+      <div class="metrics" id="c-metrics"></div>
+      <div class="grid g2">
+        <div class="panel">
+          <h3>Original section (the answer)</h3>
+          <img id="c-clean" alt="Original section" width="701" height="255" loading="lazy">
+        </div>
+        <div class="panel">
+          <h3>What the denoiser removed</h3>
+          <img id="c-removed" alt="Removed noise" width="701" height="255" loading="lazy">
+          <p class="caption">Drawn on the same colour scale as the sections, so it is faint. It should look
+            like noise: any reflector or fault visible here would be geology lost.</p>
+        </div>
+      </div>
+    </div>
+
+    <h2 style="margin-top:32px">Fault picks survive denoising</h2>
+    <p class="intro">The fault head runs on each version of the section. Its picks on the original
+      are the reference; the Dice score measures how well picks on the noisy and denoised sections
+      reproduce them. Picks are drawn where fault probability is at least <span id="thr"></span>.</p>
+    <div class="card">
+      <div class="grid g3" style="margin-top:0">
+        <div class="panel"><h3>On the original</h3><img id="f-clean" alt="Fault picks on original" width="701" height="255" loading="lazy"></div>
+        <div class="panel"><h3 id="f-noisy-h">On the noisy input</h3><img id="f-noisy" alt="Fault picks on noisy input" width="701" height="255" loading="lazy"></div>
+        <div class="panel"><h3 id="f-den-h">On the denoised section</h3><img id="f-denoised" alt="Fault picks on denoised section" width="701" height="255" loading="lazy"></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="facies">
+    <h2>Facies on real F3 data</h2>
+    <p class="intro">The facies head classifies the six lithostratigraphic units of the F3 block on
+      denoised real seismic. These inlines were held out from its training, behind a buffer, and
+      are compared with the published interpretation of Alaudah et al. (2019).</p>
+    <div class="picker" id="pick-facies" role="group" aria-label="Held-out inline"></div>
+    <div class="card">
+      <div class="grid g3" style="margin-top:0">
+        <div class="panel"><h3>Denoised real seismic</h3><img id="x-seismic" alt="Denoised real seismic" width="701" height="255"></div>
+        <div class="panel"><h3 id="x-pred-h">Predicted facies</h3><img id="x-pred" alt="Predicted facies" width="701" height="255"></div>
+        <div class="panel"><h3>Published interpretation</h3><img id="x-truth" alt="Interpreted facies labels" width="701" height="255"></div>
+      </div>
+      <div class="legend" id="legend"></div>
+      <p class="caption">Numbers beside each unit are its held-out IoU (intersection over union) across all six held-out inlines.</p>
+    </div>
+  </section>
+
+  <section id="benchmark">
+    <h2>Benchmark</h2>
+    <p class="intro">Every method is scored on the same held-out inlines with the same added noise,
+      against the original section. Higher SNR and SSIM are better; energy removed is the share of
+      the input variance taken out.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Method</th><th>SNR (dB)</th><th>SSIM</th><th>Energy removed</th></tr></thead>
+        <tbody id="bench"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer>
+    <p>Every image and number on this page was produced by the project's own trained models and
+      evaluation code; the page itself is static, so nothing is computed when you open it. The full
+      interactive dashboard, with the survey explorer and 3D view, runs locally with
+      <code>streamlit run app/dashboard.py</code>.</p>
+    <p>Data: F3 Netherlands block (dGB Earth Sciences); facies labels from Alaudah et al. (2019),
+      <a href="https://zenodo.org/record/3755060">Zenodo 3755060</a>.</p>
+  </footer>
+</main>
+
+<script id="data" type="application/json">/*__DATA__*/null</script>
+<script>
+(function () {
+  "use strict";
+  var D = JSON.parse(document.getElementById("data").textContent);
+  var $ = function (id) { return document.getElementById(id); };
+  var f2 = function (x) { return x.toFixed(2); };
+  var f3 = function (x) { return x.toFixed(3); };
+  var pct = function (x) { return (100 * x).toFixed(1) + "%"; };
+
+  // Headline tiles
+  var h = D.headline;
+  var tiles = [
+    ["Signal-to-noise ratio", f2(h.snr_out) + " dB",
+     "from " + f2(h.snr_in) + " dB on the noisy input, <span class='up'>+" + f2(h.snr_out - h.snr_in) + " dB</span>"],
+    ["Structural similarity (SSIM)", f3(h.ssim), "to the original section, over " + h.n_sections + " held-out inlines"],
+    ["Fault-pick agreement (Dice)", f3(h.dice_out), "from " + f3(h.dice_in) + " on the noisy input"],
+    ["Facies mean IoU", f3(h.miou), "all six units, on held-out inlines"]
+  ];
+  $("stats").innerHTML = tiles.map(function (t) {
+    return "<div class='stat'><div class='label'>" + t[0] + "</div><div class='value'>" + t[1] +
+           "</div><div class='sub'>" + t[2] + "</div></div>";
+  }).join("");
+  $("thr").textContent = D.threshold;
+
+  function picker(el, items, onPick) {
+    var buttons = items.map(function (item, i) {
+      var b = document.createElement("button");
+      b.type = "button";
+      b.textContent = "Inline " + item.inline;
+      b.addEventListener("click", function () { select(i); });
+      el.appendChild(b);
+      return b;
+    });
+    function select(i) {
+      buttons.forEach(function (b, j) { b.setAttribute("aria-pressed", String(i === j)); });
+      onPick(items[i]);
+    }
+    var lab = document.createElement("span");
+    lab.className = "label"; lab.textContent = "Held-out inline:";
+    el.insertBefore(lab, el.firstChild);
+    return select;
+  }
+
+  // Controlled test
+  var pickC = picker($("pick-controlled"), D.controlled, function (s) {
+    ["clean", "noisy", "denoised", "removed"].forEach(function (k) { $("c-" + k).src = s.img[k]; });
+    $("f-clean").src = s.img.fault_clean;
+    $("f-noisy").src = s.img.fault_noisy;
+    $("f-denoised").src = s.img.fault_denoised;
+    $("f-noisy-h").textContent = "On the noisy input · Dice " + f3(s.dice_noisy);
+    $("f-den-h").textContent = "On the denoised section · Dice " + f3(s.dice_denoised);
+    $("c-metrics").innerHTML =
+      "<span>SNR <b>" + f2(s.snr_in) + "</b> <span class='arrow'>→</span> <b>" + f2(s.snr_out) + " dB</b></span>" +
+      "<span>SSIM <b>" + f3(s.ssim_in) + "</b> <span class='arrow'>→</span> <b>" + f3(s.ssim_out) + "</b></span>" +
+      "<span>Energy removed <b>" + pct(s.removed) + "</b></span>";
+  });
+
+  // Facies
+  var pickF = picker($("pick-facies"), D.facies, function (s) {
+    $("x-seismic").src = s.img.seismic;
+    $("x-pred").src = s.img.pred;
+    $("x-truth").src = s.img.truth;
+    $("x-pred-h").textContent = "Predicted facies · " + pct(s.accuracy) + " pixels match";
+  });
+  $("legend").innerHTML = D.facies_classes.map(function (c) {
+    return "<span><i style='background:" + c.color + "'></i>" + c.name + " <em>" + f3(c.iou) + "</em></span>";
+  }).join("");
+
+  // Benchmark
+  $("bench").innerHTML = D.benchmark.map(function (r) {
+    return "<tr" + (r.ours ? " class='ours'" : "") + "><td>" + r.method + "</td><td>" + f2(r.snr) +
+           " ± " + f2(r.snr_std) + "</td><td>" + f3(r.ssim) + "</td><td>" + pct(r.removed) + "</td></tr>";
+  }).join("");
+
+  // Comparison slider
+  var wipe = $("wipe"), range = wipe.querySelector("input");
+  var top = wipe.querySelector(".top"), handle = wipe.querySelector(".handle");
+  function setWipe(v) {
+    top.style.clipPath = "inset(0 " + (100 - v) + "% 0 0)";
+    handle.style.left = v + "%";
+  }
+  range.addEventListener("input", function () { setWipe(+range.value); });
+  setWipe(+range.value);
+
+  pickC(D.start_controlled);
+  pickF(0);
+
+  // Warm the cache for the other inlines once the visible ones are in, so switching is instant.
+  function preload() {
+    D.controlled.concat(D.facies).forEach(function (s) {
+      Object.keys(s.img).forEach(function (k) { new Image().src = s.img[k]; });
+    });
+  }
+  if (document.readyState === "complete") setTimeout(preload, 300);
+  else window.addEventListener("load", function () { setTimeout(preload, 300); });
+})();
+</script>
+</body>
+</html>
