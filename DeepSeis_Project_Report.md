@@ -3,7 +3,8 @@
 **Project report** · MC²Plus × Oil India Ltd. × IIT Kharagpur Energy Innovation Challenge 2026,
 Track 1: AI-Driven Subsurface Intelligence · Soubhagya Raha, IIT Kanpur
 
-[README](README.md) · [Live demo](https://sraha23-deepseis.static.hf.space) ·
+[README](README.md) · [Live demo](https://deepseis-3qkjgkvqrwgvghnjxpm4mb.streamlit.app/) ·
+[Results at a glance](https://sraha23-deepseis.static.hf.space) ·
 [Data and trained models](https://huggingface.co/datasets/SRaha23/Seismic_Data)
 
 ---
@@ -468,14 +469,17 @@ These tests caught real defects that would otherwise have shipped silently:
 
 ## 8. Using DeepSeis
 
-- **Interactive dashboard** (`streamlit run app/dashboard.py`), with seven tabs: denoising
+- **Interactive dashboard**, live at
+  [deepseis-3qkjgkvqrwgvghnjxpm4mb.streamlit.app](https://deepseis-3qkjgkvqrwgvghnjxpm4mb.streamlit.app/)
+  or run locally with `streamlit run app/dashboard.py`. It has seven tabs: denoising
   with the difference section, uncertainty map and a controlled experiment with live noise
   sliders; fault segmentation on noisy and denoised input; a 3D block view of the survey; an
   inline explorer covering all 401 inlines; facies against the published interpretation;
   SEG-Y and NumPy export; and spectral and leakage diagnostics. The benchmark table in the
   app is read from the evaluation report, so the app cannot disagree with it.
-- **Live demo** at [sraha23-deepseis.static.hf.space](https://sraha23-deepseis.static.hf.space):
-  a static page of precomputed results for every held-out line, which opens instantly.
+- **Results at a glance** at
+  [sraha23-deepseis.static.hf.space](https://sraha23-deepseis.static.hf.space): a static page
+  of precomputed results for every held-out line, which opens instantly.
 - **Operationally:** SEG-Y in, SEG-Y out, so it fits into an existing Petrel or OpendTect
   workflow as one more processing step. It runs on a CPU with no GPU, and runs fully offline
   once the data is local. No outside AI service or cloud is involved, which matters because

@@ -9,7 +9,8 @@ classifying the rock layers.
 
 It is trained and tested on the real **F3 Netherlands** North Sea survey.
 
-**[Live demo](https://sraha23-deepseis.static.hf.space)** ·
+**[Live demo](https://deepseis-3qkjgkvqrwgvghnjxpm4mb.streamlit.app/)** ·
+[Results at a glance](https://sraha23-deepseis.static.hf.space) ·
 [Project report](DeepSeis_Project_Report.md) ·
 [Data and trained models](https://huggingface.co/datasets/SRaha23/Seismic_Data)
 
@@ -178,20 +179,9 @@ The full method, every metric, the ablation and the frequency analysis are in th
 
 ## Try it
 
-**[Live demo](https://sraha23-deepseis.static.hf.space)**: the controlled test on every
-held-out line, with a before/after slider, fault picks on clean, noisy and denoised sections,
-facies on unseen lines, and the full benchmark. It opens instantly; nothing is computed while
-you watch.
-
-**The full interactive dashboard** runs locally in a few minutes:
-
-```bash
-pip install -r requirements.txt     # Python 3.11; CPU-only PyTorch, no GPU needed
-streamlit run app/dashboard.py      # opens http://localhost:8501
-```
-
-The trained models ship with the repository. The F3 survey (about 360 MB) downloads
-automatically from Hugging Face on first launch.
+**[Live demo](https://deepseis-3qkjgkvqrwgvghnjxpm4mb.streamlit.app/)**: the full
+interactive dashboard, running in the cloud. If nobody has opened it for a while, Streamlit
+puts it to sleep. Click the button on the page to wake it; that takes about a minute.
 
 | Tab | What it shows |
 |---|---|
@@ -203,8 +193,22 @@ automatically from Hugging Face on first launch.
 | Export | Download a denoised section as SEG-Y or NumPy |
 | Diagnostics | F-K spectra before and after, energy kept per frequency band, and the signal-leakage map |
 
-Once the data is on disk, DeepSeis runs entirely offline. No cloud service sees the data, which
-matters because seismic data is among the most confidential assets an operator owns.
+**[Results at a glance](https://sraha23-deepseis.static.hf.space)**: a lightweight page of
+precomputed results that opens instantly on any device. It shows the controlled test on every
+held-out line with a before/after slider, fault picks on clean, noisy and denoised sections,
+facies on unseen lines, and the full benchmark.
+
+**Run it locally** in a few minutes:
+
+```bash
+pip install -r requirements.txt     # Python 3.11; CPU-only PyTorch, no GPU needed
+streamlit run app/dashboard.py      # opens http://localhost:8501
+```
+
+The trained models ship with the repository. The F3 survey (about 360 MB) downloads
+automatically from Hugging Face on first launch. Once the data is on disk, DeepSeis runs
+entirely offline. No cloud service sees the data, which matters because seismic data is among
+the most confidential assets an operator owns.
 
 ## Reproduce the results
 
